@@ -1,0 +1,27 @@
+{
+  "name": "apollo-drainage-analyst",
+  "version": "1.0.0",
+  "description": "Apollo Drainage Analyst — automated pre/post drainage analysis from DXF or LandXML",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "samples": "tsx scripts/makeSamples.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "author": "Apollo Development",
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "@preact/preset-vite": "^2.10.6",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "vite": "^5.4.21"
+  },
+  "dependencies": {
+    "delaunator": "^5.1.0",
+    "dxf-parser": "^1.1.2",
+    "preact": "^11.2.0"
+  },
+  "type": "module",
+  "private": true
+}
