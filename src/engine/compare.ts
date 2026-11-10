@@ -57,7 +57,7 @@ export function compare(pre: AnalysisResult, post: AnalysisResult) {
     }
     if (!a || !b) continue
     const bad = r.storms.map((s, k) => ({ s, k })).filter((x) => !x.s.ok)
-    const basins = post.basins.filter((B) => resolveDP(post, B.outflowTo) === r.name)
+    const basins = post.basins.filter((B) => resolveDP(post, B.outflowTo) === r.name && B.inflow.some((x) => x.peak > 0.01))
 
     const dImp = r.postImpAc - r.preImpAc
     if (!bad.length) {
@@ -183,13 +183,14 @@ export function compare(pre: AnalysisResult, post: AnalysisResult) {
   return { rows, suggestions: out }
 }
 
+const bare = (n: string) => n.replace(/ \(via inlets\)$/, '')
 function tributaryTo(r: AnalysisResult, s: AnalysisResult['subs'][number]) {
-  return resolveDP(r, s.toName)
+  return resolveDP(r, bare(s.toName))
 }
 
 function passesBasin(r: AnalysisResult, s: AnalysisResult['subs'][number]) {
   if (s.kind === 'basin') return true
-  let cur = s.toName
+  let cur = bare(s.toName)
   for (let g = 0; g < 50; g++) {
     if (r.basins.some((b) => b.name === cur)) return true
     const st = r.structures.find((x) => x.kind === 'inlet' && x.label === cur)

@@ -1,5 +1,5 @@
 /// <reference lib="webworker" />
-import { analyze, type AnalysisOutput } from './engine/analyze'
+import { analyze, siteRingsOf, type AnalysisOutput } from './engine/analyze'
 import { importFile } from './engine/importer'
 import type { Condition, Drawing, LayerInfo, Role, Settings } from './engine/types'
 
@@ -24,7 +24,7 @@ function merge(ds: Drawing[]): Drawing {
   for (const d of ds)
     for (const l of d.layers) {
       const e = layers.get(l.name)
-      if (e) { e.count += l.count; e.closed += l.closed; e.withZ += l.withZ; e.faces += l.faces; e.points += l.points }
+      if (e) { e.count += l.count; e.closed += l.closed; e.withZ += l.withZ; e.faces += l.faces; e.points += l.points; e.polys = (e.polys ?? 0) + (l.polys ?? 0); e.polysZ = (e.polysZ ?? 0) + (l.polysZ ?? 0) }
       else layers.set(l.name, { ...l })
     }
   return {
@@ -62,7 +62,10 @@ self.onmessage = (ev: MessageEvent<WorkerIn>) => {
       const onProgress = (msg: string) => post({ type: 'progress', id: m.id, condition: m.condition, msg })
       let r: AnalysisOutput
       if (m.condition === 'pre') {
-        r = analyze(d, 'pre', m.settings, { onProgress })
+        // a limit of disturbance usually lives on the proposed plan; use it for existing too
+        // the limit of disturbance usually lives on the proposed plan; use it for existing too
+        const siteRings = !siteRingsOf(d).length && drawings.post ? siteRingsOf(drawings.post) : undefined
+        r = analyze(d, 'pre', m.settings, { onProgress, siteRings })
         lastPre = r
       } else {
         const base = lastPre
@@ -71,6 +74,7 @@ self.onmessage = (ev: MessageEvent<WorkerIn>) => {
           forcedDPs: base?.dps.map((p) => ({ id: p.id, name: p.name, x: p.x, y: p.y })),
           base: base ? { grid: base.grid, coverGrid: base.coverGrid, hsgGrid: base.hsgGrid, z: base.z } : undefined,
           prePeaks: base ? Object.fromEntries(base.dps.map((p) => [p.id, p.storms.map((s) => s.peak)])) : undefined,
+          siteRings: !siteRingsOf(d).length && drawings.pre ? siteRingsOf(drawings.pre) : undefined,
         })
       }
       const { z: _z, ...rest } = r

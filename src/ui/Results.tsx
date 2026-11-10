@@ -125,10 +125,11 @@ export function SubDetail({ r, s }: { r: AnalysisResult; s: Subcatchment }) {
 }
 
 export function BasinCards({ r }: { r: AnalysisResult }) {
-  if (!r.basins.length) return null
+  const basins = r.basins.filter((B) => B.inflow.some((x) => x.peak > 0.01))
+  if (!basins.length) return null
   return (
     <div class="detail">
-      {r.basins.map((B) => (
+      {basins.map((B) => (
         <div class="mock">
           <div class="mock__eyebrow">{B.name} · Stage-storage from the proposed surface</div>
           <p class="mock__desc">Bottom {B.bottom.toFixed(2)} · rim {B.rim.toFixed(2)} · {Math.round(B.maxStorage).toLocaleString()} cf to rim · outlet {B.piped ? 'piped' : 'overland'} to {B.outflowTo}</p>

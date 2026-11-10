@@ -6,6 +6,7 @@ export const COVERS: Record<CoverKey, { desc: string; cn: [number, number, numbe
   roof: { desc: 'Roofs', cn: [98, 98, 98, 98], sheetN: 0.011, paved: true, imperv: true, color: '#8a8f98', kv: 20.3282, kvDesc: 'Paved' },
   pavement: { desc: 'Paved parking, roads, walks', cn: [98, 98, 98, 98], sheetN: 0.011, paved: true, imperv: true, color: '#5f6670', kv: 20.3282, kvDesc: 'Paved' },
   gravel: { desc: 'Gravel surface', cn: [76, 85, 89, 91], sheetN: 0.05, paved: false, imperv: false, color: '#b9a888', kv: 16.1345, kvDesc: 'Unpaved' },
+  dirt: { desc: 'Dirt roads (incl. right-of-way)', cn: [72, 82, 87, 89], sheetN: 0.05, paved: false, imperv: false, color: '#a68a64', kv: 16.1345, kvDesc: 'Unpaved' },
   grass: { desc: 'Open space, >75% grass cover, good', cn: [39, 61, 74, 80], sheetN: 0.24, paved: false, imperv: false, color: '#8fd18a', kv: 7.0, kvDesc: 'Short grass' },
   meadow: { desc: 'Meadow, non-grazed', cn: [30, 58, 71, 78], sheetN: 0.24, paved: false, imperv: false, color: '#c7d98a', kv: 7.0, kvDesc: 'Meadow / pasture' },
   woods: { desc: 'Woods, good', cn: [30, 55, 70, 77], sheetN: 0.4, paved: false, imperv: false, color: '#3f8f5a', kv: 5.0, kvDesc: 'Woodland' },

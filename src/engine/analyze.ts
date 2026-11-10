@@ -17,6 +17,10 @@ export interface AnalyzeOptions {
   forcedDPs?: { id: string; name: string; x: number; y: number }[]
   /** Existing-condition result, used to fill proposed surface gaps and carry forward undisturbed cover/soils. */
   base?: Pick<AnalysisResult, 'grid' | 'coverGrid' | 'hsgGrid'> & { z?: Float64Array }
+  /** Window to analyze (set internally for the fine second pass). */
+  crop?: { x0: number; y0: number; x1: number; y1: number }
+  /** Site limit (LOD / property line) from the other condition, when this drawing has none. */
+  siteRings?: Ring[]
   /** Existing peaks by DP id → per storm, for outlet design. */
   prePeaks?: Record<string, number[]>
   onProgress?: (msg: string) => void
@@ -42,6 +46,7 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
   say('Reading surface')
   const prim = collectSurface(d, byRole('surface'), true)
   const sec = collectSurface(d, byRole('surface-ex'), false)
+  robustFilter(prim, sec, warnings)
   if (!prim.pts.length && !prim.faces.length && !sec.pts.length && !sec.faces.length && !opt.base?.z)
     throw new Error('No elevation data found. Assign your contour, TIN, or spot-elevation layers the "Surface" role.')
 
@@ -59,6 +64,7 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
     const sb = extent([...studyRings.flat(), ...studyShapes.open.flat()].map((p) => [p[0], p[1], 0] as V3))
     bb = { x0: Math.max(bb.x0, sb.x0), y0: Math.max(bb.y0, sb.y0), x1: Math.min(bb.x1, sb.x1), y1: Math.min(bb.y1, sb.y1) }
   }
+  if (opt.crop) bb = { x0: Math.max(bb.x0, opt.crop.x0), y0: Math.max(bb.y0, opt.crop.y0), x1: Math.min(bb.x1, opt.crop.x1), y1: Math.min(bb.y1, opt.crop.y1) }
   const area = (bb.x1 - bb.x0) * (bb.y1 - bb.y0)
   if (!(area > 0)) throw new Error('The surface has no extent.')
   const cs = niceCell(Math.sqrt(area / S.targetCells))
@@ -111,7 +117,7 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
   for (let i = 0; i < N; i++) if (valid[i]) { nValid++; if (z[i] < zmin) zmin = z[i]; if (z[i] > zmax) zmax = z[i] }
   if (nValid < 50) throw new Error('The surface covers too little area to analyze.')
   if (zmax - zmin < 0.25) throw new Error('The surface is flat (relief under 0.25 ft). Check that the contour layers carry elevations.')
-  const studyAc = nValid * cellAc
+  let studyAc = nValid * cellAc
 
   /* ---------------- cover + soils ---------------- */
   say('Mapping land cover and soils')
@@ -136,7 +142,7 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
   }
   const defKey: CoverKey = S.defaultCover === 'carry' || COVERS[S.defaultCover]?.imperv ? 'woods' : S.defaultCover
   const defCover = COVER_KEYS.indexOf(defKey)
-  const PRIORITY: CoverKey[] = ['woods', 'meadow', 'wetland', 'water', 'grass', 'gravel', 'pavement', 'roof']
+  const PRIORITY: CoverKey[] = ['woods', 'meadow', 'wetland', 'water', 'grass', 'dirt', 'gravel', 'pavement', 'roof']
   const allTexts = d.ents.filter((e) => e.kind === 'text' && e.text)
   const coverFills: { k: number; area: number; apply: (fn: (i: number) => void) => void }[] = []
   let openCoverLayers = 0
@@ -150,17 +156,41 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
     // open linework: enclosed areas become shapes; open-ended areas count only when a label or symbol says so
     openCoverLayers++
     const reg = regionsFromLinework([...sh.open, ...sh.rings.map(closeRing)], grid)
+    // An open-ended area (e.g. one side of a tree line) is only used for pervious cover, and only when a label
+    // or symbol on a matching layer (E-TREE-TEXT, E-TREE-SYM...) sits inside it and it isn't most of the drawing.
+    // Impervious cover always needs an enclosed outline.
     const votes = new Map<number, number>()
     const vote = (x: number, y: number) => { const c = cellAt(x, y); if (c >= 0 && reg.comp[c] >= 0) votes.set(reg.comp[c], (votes.get(reg.comp[c]) ?? 0) + 1) }
-    for (const t of allTexts) if (COVER_RX[key].test((t.text ?? '').toUpperCase())) vote(t.pts[0][0], t.pts[0][1])
-    for (const e of ents) if (e.kind === 'insert' || e.kind === 'circle' || e.kind === 'point') vote(e.pts[0][0], e.pts[0][1])
+    if (!COVERS[key].imperv) {
+      const sameKind = (layer: string) => COVER_RX[key].test(layer.toUpperCase())
+      for (const t of allTexts) if (sameKind(t.layer) && COVER_RX[key].test((t.text ?? '').toUpperCase())) vote(t.pts[0][0], t.pts[0][1])
+      for (const e of d.ents) if ((e.kind === 'insert' || e.kind === 'circle' || e.kind === 'point') && sameKind(e.layer)) vote(e.pts[0][0], e.pts[0][1])
+    }
+    const compSize = new Map<number, number>()
+    for (let i = 0; i < N; i++) if (reg.comp[i] >= 0) compSize.set(reg.comp[i], (compSize.get(reg.comp[i]) ?? 0) + 1)
+    // width of each region (twice the largest distance to its edge): a road or drive is a narrow strip, a building
+    // or parking lot is compact, while an infield ringed by a loop road is wide and large — not pavement.
+    const width = regionWidths(reg.comp, grid)
+    const hardCover = COVERS[key].imperv || key === 'gravel' || key === 'dirt'
     const take = new Uint8Array(N)
+    // roads and drives: cells with this class's edge lines on both sides within road width, whatever gaps
+    // the linework has at intersections
+    if (hardCover) {
+      const strip = stripCells([...sh.open, ...sh.rings.map(closeRing)], grid, key === 'roof' ? 0 : 45)
+      for (let i = 0; i < N; i++) if (strip[i]) take[i] = 1
+    }
     let n = 0
     for (let i = 0; i < N; i++) {
       const c = reg.comp[i]
       if (c < 0) continue
-      if (!reg.exterior[c] || votes.has(c)) { take[i] = 1; n++ }
+      const ac = (compSize.get(c) ?? 0) * cellAc
+      const w = width.get(c) ?? 0
+      let ok: boolean
+      if (hardCover) ok = !reg.exterior[c] && (ac <= 1.5 || w <= 45)
+      else ok = !reg.exterior[c] || (votes.has(c) && (compSize.get(c) ?? 0) < 0.5 * nValid)
+      if (ok) take[i] = 1
     }
+    for (let i = 0; i < N; i++) if (take[i]) n++
     if (!n) { warnings.push(`Open linework on ${[...new Set(ents.map((e) => e.layer))].join(', ')} encloses no area; add a "${key.toUpperCase()}" label on the correct side.`); continue }
     coverFills.push({ k, area: n * cs * cs, apply: (fn) => { for (let i = 0; i < N; i++) if (take[i]) fn(i) } })
   }
@@ -170,19 +200,38 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
   for (const p of coverFills) p.apply((i) => { if (valid[i]) { cover[i] = p.k; src[i] = 1 } })
   for (let i = 0; i < N; i++) if (valid[i] && cover[i] === 255) cover[i] = defCover
 
+  let soilUnits: { unit: string; hsg: string; areaAc: number }[] = []
   const soilEnts = byRole('soils')
   const soilSh = shapesOf(soilEnts)
   if (soilSh.rings.length || soilSh.open.length) {
     const reg = regionsFromLinework([...soilSh.open, ...soilSh.rings.map(closeRing)], grid)
-    const labs = [...soilEnts.filter((e) => e.kind === 'text'), ...allTexts.filter((t) => /HSG/i.test(t.text ?? '') && role(t) !== 'soils')]
+    const labs = allTexts.filter((t) => /SOIL|HSG/i.test(t.layer) || /HSG/i.test(t.text ?? ''))
     const hsgOf = new Map<number, number>()
+    const unitOf = new Map<number, string>()
     for (const t of labs) {
-      const g = parseHSG(t.text ?? '')
+      const raw = (t.text ?? '').trim()
+      let g = parseHSG(raw)
       const c = cellAt(t.pts[0][0], t.pts[0][1])
-      if (g >= 0 && c >= 0 && reg.comp[c] >= 0 && !hsgOf.has(reg.comp[c])) hsgOf.set(reg.comp[c], g)
+      if (c < 0 || reg.comp[c] < 0 || hsgOf.has(reg.comp[c])) continue
+      if (g < 0) {
+        // a map-unit symbol (e.g. 238BH): use the HSG set for it in settings, else the default
+        const unit = raw.toUpperCase().replace(/[^A-Z0-9]/g, ' ').trim().split(/\s+/)[0]
+        if (!unit || unit.length > 8) continue
+        unitOf.set(reg.comp[c], unit)
+        const m = S.soilMap?.[unit]
+        g = m ? 'ABCD'.indexOf(m) : 'ABCD'.indexOf(S.defaultHSG)
+      }
+      hsgOf.set(reg.comp[c], g)
     }
     if (!hsgOf.size) warnings.push('Soil linework found but no HSG labels (e.g. "HSG C") inside it; default HSG used.')
-    for (let i = 0; i < N; i++) if (valid[i] && reg.comp[i] >= 0) { const g = hsgOf.get(reg.comp[i]); if (g != null) hsg[i] = g }
+    const unitArea = new Map<string, number>()
+    for (let i = 0; i < N; i++) if (valid[i] && reg.comp[i] >= 0) {
+      const g = hsgOf.get(reg.comp[i]); if (g != null) hsg[i] = g
+      const u = unitOf.get(reg.comp[i]); if (u) unitArea.set(u, (unitArea.get(u) ?? 0) + cellAc)
+    }
+    soilUnits = [...unitArea.entries()].map(([unit, areaAc]) => ({ unit, areaAc, hsg: S.soilMap?.[unit] ?? '' }))
+    const unset = soilUnits.filter((u) => !u.hsg)
+    if (unset.length) warnings.push(`Soil map units ${unset.map((u) => u.unit).join(', ')} have no HSG set; using HSG ${S.defaultHSG}. Set them under Storms & settings.`)
   }
   const defH = 'ABCD'.indexOf(S.defaultHSG)
   for (let i = 0; i < N; i++) if (valid[i] && hsg[i] === 255) hsg[i] = defH
@@ -208,27 +257,37 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
   const storm = byRole('storm')
   const structures: (Structure & { cell: number; comp: number })[] = []
   const pipes: XY[][] = []
+  // pipes only from pipe/culvert layers (swales, ditches, underdrains and slope arrows are surface features)
+  const pipeLayer = (l: string) => /PIPE|CULV|STORM|STRM|\bSD\b|\bSTM\b|DRAIN.?LINE|\bRCP\b|HDPE|CMP/i.test(l) && !/SWALE|DITCH|UNDER|PERF|SHADE|TEXT|LBL|FOUND/i.test(l)
+  const structLayer = (l: string) => /SYM|STRC|STRUCT|\bCB\b|INLET|CATCH|\bMH\b|\bFES\b|\bHW\b|OCS/i.test(l) || /STORM|STRM/i.test(l)
   for (const e of storm) {
     if (e.kind === 'poly') {
       const ring = e.pts.map((p) => [p[0], p[1]] as XY)
       const bbx = ringBBox(ring)
       const diag = Math.hypot(bbx.x1 - bbx.x0, bbx.y1 - bbx.y0)
-      if (e.closed && diag < 12) structures.push(mkStruct(centroid(ring), e.layer, '', 0))
-      else if (!e.closed) pipes.push(ring)
+      if (e.closed && diag < 12 && structLayer(e.layer)) { const st = mkStruct(centroid(ring), e.layer, ''); if (st) structures.push(st) }
+      else if (!e.closed && pipeLayer(e.layer)) pipes.push(ring)
     } else if (e.kind === 'insert' || e.kind === 'circle' || e.kind === 'point') {
       if (e.kind === 'circle' && (e.r ?? 0) > 12) continue
-      structures.push(mkStruct([e.pts[0][0], e.pts[0][1]], e.layer, e.name ?? '', 0))
+      if (e.kind !== 'insert' && !structLayer(e.layer)) continue
+      const st = mkStruct([e.pts[0][0], e.pts[0][1]], e.layer, e.name ?? '')
+      if (st) structures.push(st)
     }
   }
-  function mkStruct(p: XY, layer: string, name: string, _c: number) {
-    const n = (name + ' ' + layer).toUpperCase()
-    const kind: Structure['kind'] = /OCS|OUTLET.?CONTROL|RISER/.test(n)
-      ? 'ocs'
-      : /\bMH\b|MANHOLE|DMH|JUNCT|\bJB\b/.test(n)
-      ? 'junction'
-      : /FES|FLARED|HEADWALL|\bHW\b|OUTFALL|ENDWALL|\bRIP|SPLASH|LEVEL.?SPREAD/.test(n)
-      ? 'outfall'
-      : 'inlet'
+  /** Classify a drainage symbol by block name first (CB, MH, HW...), then by layer. Unknown symbols (slope arrows,
+   *  flow labels) are skipped. */
+  function mkStruct(p: XY, layer: string, name: string): (Structure & { cell: number; comp: number }) | null {
+    const b = name.toUpperCase(), l = layer.toUpperCase()
+    const classify = (n: string): Structure['kind'] | null =>
+      /OCS|OUTLET.?CONTROL|RISER/.test(n) ? 'ocs'
+      : /MH|MANHOLE|DMH|JUNCT|\bJB\b|CLEAN.?OUT/.test(n) ? 'junction'
+      : /FES|FLARED|HEADWALL|HWALL|\bHW\b|OUTFALL|ENDWALL|\bRIP|SPLASH|LEVEL.?SPREAD/.test(n) ? 'outfall'
+      : /\bCB|CB\b|CATCH|INLET|BASIN|\bDI\b|DROP|\bYD\b|YARD|LAWN.?DRAIN|GRATE|AREA.?DRAIN|CBR/.test(n) ? 'inlet'
+      : null
+    let kind = b ? classify(b) : null
+    if (!kind) kind = classify(l)
+    if (!kind && !b && /STRC|STRUCT|SYM/.test(l)) kind = 'inlet' // bare circles on a structure layer
+    if (!kind) return null
     return { x: p[0], y: p[1], kind, label: name, cell: cellAt(p[0], p[1]), comp: -1 }
   }
   // dedupe structures drawn as block + circle at the same spot
@@ -366,7 +425,144 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
         if (dd < burnR) zr[r * nx + c] -= 0.5 * (1 - dd / burnR)
       }
   }
+  // Site mode (no explicit study area): follow the flow from the work area (limit of disturbance, or the property
+  // if no LOD) downstream to where it leaves the property; design points go there, and each subcatchment is the
+  // full watershed to its design point — upslope run-on and lateral area included, unrelated land excluded.
+  const lodEnts = siteEntities(d, role, true)
+  const propEnts = siteEntities(d, role, false)
+  const toMask = (ents: Ent[], extra?: Ring[]) => {
+    const sh = shapesOf(ents)
+    if (extra?.length) sh.rings.push(...extra)
+    if (!sh.rings.length && !sh.open.length) return null
+    const m = new Uint8Array(N)
+    for (const r of sh.rings) rasterizeRing(r, grid, (i) => { m[i] = 1 })
+    if (sh.open.length) {
+      const reg = regionsFromLinework([...sh.open, ...sh.rings.map(closeRing)], grid)
+      for (let i = 0; i < N; i++) if (reg.blob[i] >= 0) m[i] = 1
+    }
+    let n = 0
+    for (let i = 0; i < N; i++) if (m[i] && valid[i]) n++
+    return n > 20 ? m : null
+  }
+  const lodMask = toMask(lodEnts, lodEnts.length ? undefined : opt.siteRings)
+  const propMask = toMask(propEnts)
+  // Roads act as drainage divides (crown / ditch line): raise road, driveway and trail edges slightly in the
+  // routing surface so overland flow runs along a road to its low end instead of across it.
+  if (S.roadDivides !== false) {
+    const roadEdge = (e: Ent) => {
+      const r = role(e)
+      return (r === 'cover:pavement' || r === 'cover:gravel' || /ROAD|TRAIL|DRIVE|TRAVEL|CURB/i.test(e.layer)) && e.kind === 'poly' && !/TEXT|LBL|NAME|CL\b|CENTER|SHADE|HATCH/i.test(e.layer) && !e.hatch
+    }
+    let walls = 0
+    const wall = new Uint8Array(N)
+    for (const e of d.ents) {
+      if (!roadEdge(e)) continue
+      let L = 0
+      for (let k = 1; k < e.pts.length; k++) L += Math.hypot(e.pts[k][0] - e.pts[k - 1][0], e.pts[k][1] - e.pts[k - 1][1])
+      if (L < 60) continue
+      walls++
+      for (let k = 1; k < e.pts.length; k++) {
+        const a = e.pts[k - 1], b = e.pts[k]
+        const n = Math.max(1, Math.ceil((Math.hypot(b[0] - a[0], b[1] - a[1]) / cs) * 2))
+        for (let t = 0; t <= n; t++) {
+          const c = cellAt(a[0] + ((b[0] - a[0]) * t) / n, a[1] + ((b[1] - a[1]) * t) / n)
+          if (c >= 0 && !sinkCells.has(c)) { zr[c] = z[c] + 0.75; wall[c] = 1 }
+        }
+      }
+    }
+    // Outside the work area a road bounds the analysis (flow from beyond it is not run-on to the site):
+    // make those edges hard, keeping a buffer around the work so roads through the site stay crossable.
+    const work = lodMask ?? propMask
+    if (walls && work && !studyRings.length) {
+      const bufCells = Math.ceil(60 / cs)
+      const near = new Uint8Array(N)
+      let front: number[] = []
+      for (let i = 0; i < N; i++) if (work[i]) { near[i] = 1; front.push(i) }
+      for (let st = 0; st < bufCells && front.length; st++) {
+        const nx2: number[] = []
+        for (const i of front) for (const dd of [1, -1, nx, -nx]) { const j = i + dd; if (j >= 0 && j < N && !near[j]) { near[j] = 1; nx2.push(j) } }
+        front = nx2
+      }
+      let hard = 0
+      for (let i = 0; i < N; i++) {
+        if (!wall[i] || near[i]) continue
+        const c0 = i % nx, r0 = (i - c0) / nx
+        for (let dr = -1; dr <= 1; dr++) for (let dc = -1; dc <= 1; dc++) {
+          const c = c0 + dc, r = r0 + dr
+          if (c >= 0 && r >= 0 && c < nx && r < ny && !near[r * nx + c] && valid[r * nx + c]) { valid[r * nx + c] = 0; hard++ }
+        }
+      }
+      if (hard) {
+        isEdge.fill(0)
+        for (let i = 0; i < N; i++) {
+          if (!valid[i]) continue
+          const c = i % nx, r = (i - c) / nx
+          for (let k = 0; k < 8; k++) {
+            const cc = c + nbc[k], rr = r + nbr[k]
+            if (cc < 0 || rr < 0 || cc >= nx || rr >= ny || !valid[rr * nx + cc]) { isEdge[i] = 1; break }
+          }
+        }
+        for (let k = inlets.length - 1; k >= 0; k--) if (!valid[inlets[k].cell]) { sinkCells.delete(inlets[k].cell); inlets.splice(k, 1) }
+      }
+    }
+    if (walls) warnings.push(`Treated ${walls} road / drive edge line${walls > 1 ? 's' : ''} as drainage divides.`)
+  }
   let route = flowRoute(zr, valid, isEdge, sinkCells, grid, nb, nbd, nbc, nbr)
+
+  const workMask = lodMask ?? propMask
+  const bnd = propMask ?? lodMask
+  if (!studyRings.length && !studyShapes.open.length && workMask && bnd) {
+    const o = route.order, dr = route.dir
+    // everything downstream of the work area
+    const reach = new Uint8Array(N)
+    for (let k = 0; k < o.length; k++) {
+      const i = o[k]
+      if (workMask[i]) reach[i] = 1
+      if (reach[i] && dr[i] >= 0) reach[dr[i]] = 1
+    }
+    // exits: where that flow leaves the property (or the surface)
+    const isExit = new Uint8Array(N)
+    let nExit = 0
+    for (let i = 0; i < N; i++) if (reach[i] && bnd[i] && (dr[i] < 0 || !bnd[dr[i]])) { isExit[i] = 1; nExit++ }
+    const exitOf = new Int32Array(N).fill(-1)
+    for (let k = o.length - 1; k >= 0; k--) {
+      const i = o[k]
+      exitOf[i] = isExit[i] ? i : dr[i] >= 0 ? exitOf[dr[i]] : -1
+    }
+    let n2 = 0
+    for (let i = 0; i < N; i++) if (valid[i] && exitOf[i] >= 0) n2++
+    if (nExit && n2 > 50 && n2 < nValid) {
+      for (let i = 0; i < N; i++) valid[i] = valid[i] && exitOf[i] >= 0 ? 1 : 0
+      isEdge.fill(0)
+      for (let i = 0; i < N; i++) {
+        if (!valid[i]) continue
+        const c = i % nx, r = (i - c) / nx
+        for (let k = 0; k < 8; k++) {
+          const cc = c + nbc[k], rr = r + nbr[k]
+          if (cc < 0 || rr < 0 || cc >= nx || rr >= ny || !valid[rr * nx + cc]) { isEdge[i] = 1; break }
+        }
+      }
+      for (let k = inlets.length - 1; k >= 0; k--) if (!valid[inlets[k].cell]) { sinkCells.delete(inlets[k].cell); inlets.splice(k, 1) }
+      nValid = n2
+      zmin = Infinity; zmax = -Infinity
+      for (let i = 0; i < N; i++) if (valid[i]) { if (z[i] < zmin) zmin = z[i]; if (z[i] > zmax) zmax = z[i] }
+      studyAc = nValid * cellAc
+      route = flowRoute(zr, valid, isEdge, sinkCells, grid, nb, nbd, nbc, nbr)
+      // second pass at full resolution over just the area that matters (large LiDAR / GIS surfaces)
+      if (!opt.crop) {
+        let ax0 = Infinity, ay0 = Infinity, ax1 = -Infinity, ay1 = -Infinity
+        for (let i = 0; i < N; i++) if (valid[i]) { const x = cx(i), y = cy(i); if (x < ax0) ax0 = x; if (y < ay0) ay0 = y; if (x > ax1) ax1 = x; if (y > ay1) ay1 = y }
+        const m = Math.max(100, 0.1 * Math.max(ax1 - ax0, ay1 - ay0))
+        const crop = { x0: ax0 - m, y0: ay0 - m, x1: ax1 + m, y1: ay1 + m }
+        if ((crop.x1 - crop.x0) * (crop.y1 - crop.y0) < 0.5 * (bb.x1 - bb.x0) * (bb.y1 - bb.y0)) {
+          say('Refining around the site')
+          return analyze(d, condition, S, { ...opt, crop })
+        }
+      }
+      const what = lodMask ? 'limit of disturbance' : 'property'
+      warnings.push(`Analyzed the ${studyAc.toFixed(2)} ac draining to where flow from the ${what} leaves the ${propMask ? 'property' : 'site'} (upslope run-on included).`)
+    }
+  }
 
   // design points: forced (from DXF + other condition), snapped onto the flow network
   const dpEnts = byRole('designpoint').filter((e) => e.kind !== 'poly' || e.closed)
@@ -472,16 +668,6 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
     if (ik != null) return `I${ik}`
     return `D${dpOfTerm.get(t) ?? 0}`
   }
-  const unitIndex = new Map<string, number>()
-  const unitKeys: string[] = []
-  const labels = new Int32Array(N).fill(-1)
-  for (let i = 0; i < N; i++) {
-    if (!valid[i]) continue
-    const key = nodeOfCell(i)
-    let u = unitIndex.get(key)
-    if (u == null) { u = unitKeys.length; unitIndex.set(key, u); unitKeys.push(key) }
-    labels[i] = u
-  }
   const nearestDP = (x: number, y: number) => {
     let best = 0, bd = Infinity
     dpList.forEach((p, k) => { const dd = Math.hypot(cx(p.cell) - x, cy(p.cell) - y); if (dd < bd) { bd = dd; best = k } })
@@ -538,6 +724,29 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
   const nodeName = (id: string) =>
     id.startsWith('D') ? dpList[+id.slice(1)]?.name ?? id : id.startsWith('I') ? inlets[+id.slice(1)]?.name ?? id : `Basin ${+id.slice(1) + 1}`
   mark('network')
+
+  // Inlets that discharge to the same basin or design point share one subcatchment, the way they are
+  // usually modeled; each inlet still captures only its own drainage area.
+  const finalTarget = (id: string) => {
+    let cur = id, g = 0
+    while (cur.startsWith('I') && g++ < 200) cur = receiver.get(cur) ?? 'D0'
+    return cur
+  }
+  const unitKeyOf = (i: number) => {
+    const k = nodeOfCell(i)
+    return S.groupInlets !== false && k.startsWith('I') ? `V${finalTarget(k)}` : k
+  }
+  const unitIndex = new Map<string, number>()
+  const unitKeys: string[] = []
+  const labels = new Int32Array(N).fill(-1)
+  for (let i = 0; i < N; i++) {
+    if (!valid[i]) continue
+    const key = unitKeyOf(i)
+    let u = unitIndex.get(key)
+    if (u == null) { u = unitKeys.length; unitIndex.set(key, u); unitKeys.push(key) }
+    labels[i] = u
+  }
+
 
   /* ---------------- per-unit stats: area, CN, cover table ---------------- */
   say('Computing curve numbers')
@@ -697,8 +906,8 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
     const tcRaw = tcOf[u].tc
     const tcMin = Math.max(S.minTcMin, tcRaw)
     const storms = S.storms.map((st) => subHydrograph(areaAc, cn, tcMin / 60, st.P, S.distribution))
-    const kind: Subcatchment['kind'] = key[0] === 'D' ? 'dp' : key[0] === 'I' ? 'inlet' : 'basin'
-    const to = key[0] === 'D' ? key : key
+    const kind: Subcatchment['kind'] = key[0] === 'D' ? 'dp' : key[0] === 'I' || key[0] === 'V' ? 'inlet' : 'basin'
+    const to = key[0] === 'V' ? key.slice(1) : key
     const speck = 4 * cs * cs // drop single-cell slivers left by diagonal D8 joins
     const rings = (traced.get(u) ?? [])
       .filter((r) => Math.abs(polyArea(r.outer)) >= speck)
@@ -708,7 +917,7 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
       name: `${prefix}${subNo.get(u)}`,
       kind,
       to,
-      toName: nodeName(to),
+      toName: key[0] === 'V' ? `${nodeName(to)} (via inlets)` : nodeName(to),
       areaAc,
       cn: Math.round(cn * 10) / 10,
       impervPct: (100 * imp) / Math.max(1e-9, areaAc),
@@ -897,7 +1106,7 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
       hydro: h, tributaryAc: trib, impervAc: imp,
     }
   })
-  for (const s of subs) s.toName = nodeName(s.to)
+  for (const s of subs) s.toName = subs.length && s.toName.endsWith('(via inlets)') ? `${nodeName(s.to)} (via inlets)` : nodeName(s.to)
   mark('hydro')
 
   /* ---------------- display layers ---------------- */
@@ -929,11 +1138,27 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
   return {
     condition, fileName: d.fileName, settings: S, grid, bbox: bb, zmin, zmax, studyAc, dt: DT,
     subs, dps, basins, structures: structsOut, pipes, reference, contours, shade, labels,
-    coverGrid: cover, hsgGrid: hsg, warnings, timings, z,
+    coverGrid: cover, hsgGrid: hsg, soilUnits, warnings, timings, z,
   }
 }
 
 /* ======================================================================= */
+
+const LOD_RX = /LIMIT|\bLOD\b|\bLOW\b|DISTURB|CLEAR/i
+/** Site-limit entities; a limit of disturbance wins over a property line when both are drawn. */
+function siteEntities(d: Drawing, role: (e: Ent) => Role, lod?: boolean) {
+  const all = d.ents.filter((e) => role(e) === 'site' && e.kind === 'poly')
+  if (lod === true) return all.filter((e) => LOD_RX.test(e.layer))
+  if (lod === false) return all.filter((e) => !LOD_RX.test(e.layer))
+  const l = all.filter((e) => LOD_RX.test(e.layer))
+  return l.length ? l : all
+}
+
+/** Closed site-limit rings of a drawing, for handing to the other condition. */
+export function siteRingsOf(d: Drawing): Ring[] {
+  const roleOf = new Map(d.layers.map((l) => [l.name, l.role]))
+  return shapesOf(siteEntities(d, (e) => roleOf.get(e.layer) ?? 'reference', true)).rings
+}
 
 /** Closed rings (drawn closed or nearly closed) and the remaining open linework of a set of entities. */
 function shapesOf(ents: Ent[]) {
@@ -986,8 +1211,28 @@ function parseHSG(t: string) {
 
 interface SurfSrc { pts: V3[]; faces: V3[][] }
 
+/** Drop surface data far from the main body of the drawing (legends, title blocks, stray copies) or at
+ *  elevations unrelated to the rest of the site. Applied to proposed and existing sources together. */
+function robustFilter(a: SurfSrc, b: SurfSrc, warnings: string[]) {
+  const all = [...a.pts, ...b.pts, ...a.faces.flat(), ...b.faces.flat()]
+  if (all.length < 30) return
+  const q = (v: number[], f: number) => v[Math.floor(f * (v.length - 1))]
+  const xs = all.map((p) => p[0]).sort((m, n) => m - n), ys = all.map((p) => p[1]).sort((m, n) => m - n), zs = all.map((p) => p[2]).sort((m, n) => m - n)
+  const band = (v: number[], k: number, min: number) => { const m = q(v, 0.5), r = Math.max(min, q(v, 0.9) - q(v, 0.1)); return [m - k * r, m + k * r] }
+  const [x0, x1] = band(xs, 1.5, 300), [y0, y1] = band(ys, 1.5, 300), [z0, z1] = band(zs, 2, 10)
+  const ok = (p: V3) => p[0] >= x0 && p[0] <= x1 && p[1] >= y0 && p[1] <= y1 && p[2] >= z0 && p[2] <= z1
+  let dropped = 0
+  for (const s of [a, b]) {
+    const n0 = s.pts.length + s.faces.length
+    s.pts = s.pts.filter(ok)
+    s.faces = s.faces.filter((f) => f.every(ok))
+    dropped += n0 - s.pts.length - s.faces.length
+  }
+  if (dropped > 0.002 * all.length) warnings.push(`Ignored ${dropped.toLocaleString()} surface points far from the site or at outlying elevations (legend or stray linework).`)
+}
+
 function collectSurface(d: Drawing, ents: Ent[], includeTin: boolean): SurfSrc {
-  const pts: V3[] = []
+  let pts: V3[] = []
   const faces: V3[][] = []
   if (includeTin && d.tin) for (const t of d.tin.tris) faces.push([d.tin.pts[t[0]], d.tin.pts[t[1]], d.tin.pts[t[2]]])
   let totalLen = 0
@@ -1009,6 +1254,17 @@ function collectSurface(d: Drawing, ents: Ent[], includeTin: boolean): SurfSrc {
         }
       }
     } else if ((e.kind === 'point' || e.kind === 'insert') && e.hasZ) pts.push(e.pts[0])
+  }
+  // drop stray elevations (blocks at 0, symbols at odd heights): keep within a robust band around the median
+  const zs = pts.map((p) => p[2]).filter((v) => v !== 0)
+  if (zs.length > 20) {
+    zs.sort((a, b) => a - b)
+    const q = (f: number) => zs[Math.floor(f * (zs.length - 1))]
+    const med = q(0.5), iqr = Math.max(2, q(0.75) - q(0.25))
+    const lo = med - 6 * iqr, hi = med + 6 * iqr
+    pts = pts.filter((p) => p[2] !== 0 && p[2] >= lo && p[2] <= hi)
+  } else {
+    pts = pts.filter((p) => p[2] !== 0)
   }
   return { pts, faces }
 }
@@ -1134,6 +1390,67 @@ function flowRoute(
   for (let j = 0; j < nv; j++) acc[order[j]] = 1
   for (let j = 0; j < nv; j++) { const i = order[j]; if (dir[i] >= 0) acc[dir[i]] += acc[i] }
   return { dir, acc, filled, order }
+}
+
+/** Cells lying between two lines of the set within maxSpan ft (checked along 4 axes): road / drive strips. */
+function stripCells(lines: XY[][], g: GridSpec, maxSpan: number) {
+  const { nx, ny, cs } = g
+  const N = nx * ny
+  const out = new Uint8Array(N)
+  if (maxSpan <= 0 || !lines.length) return out
+  const bar = new Uint8Array(N)
+  for (const L of lines)
+    for (let i = 1; i < L.length; i++) {
+      const [x0, y0] = L[i - 1], [x1, y1] = L[i]
+      const n = Math.max(1, Math.ceil((Math.hypot(x1 - x0, y1 - y0) / cs) * 2))
+      for (let k = 0; k <= n; k++) {
+        const c = Math.floor((x0 + ((x1 - x0) * k) / n - g.x0) / cs), r = Math.floor((y0 + ((y1 - y0) * k) / n - g.y0) / cs)
+        if (c >= 0 && r >= 0 && c < nx && r < ny) bar[r * nx + c] = 1
+      }
+    }
+  const axes: [number, number][] = [[1, 0], [0, 1], [1, 1], [1, -1]]
+  for (let r = 0; r < ny; r++)
+    for (let c = 0; c < nx; c++) {
+      const i = r * nx + c
+      if (bar[i]) { out[i] = 1; continue }
+      for (const [dx, dy] of axes) {
+        const step = Math.hypot(dx, dy) * cs
+        const lim = Math.floor(maxSpan / step)
+        let a = 0, b = 0
+        for (let k = 1; k <= lim; k++) { const cc = c + dx * k, rr = r + dy * k; if (cc < 0 || rr < 0 || cc >= nx || rr >= ny) break; if (bar[rr * nx + cc]) { a = k; break } }
+        if (!a) continue
+        for (let k = 1; k + a <= lim; k++) { const cc = c - dx * k, rr = r - dy * k; if (cc < 0 || rr < 0 || cc >= nx || rr >= ny) break; if (bar[rr * nx + cc]) { b = k; break } }
+        if (b) { out[i] = 1; break }
+      }
+    }
+  return out
+}
+
+/** Width (ft) of each labeled region: twice its largest inscribed distance (chamfer distance transform). */
+function regionWidths(labels: Int32Array, g: GridSpec) {
+  const { nx, ny, cs } = g
+  const N = nx * ny
+  const D = new Float32Array(N)
+  for (let i = 0; i < N; i++) D[i] = labels[i] < 0 ? 0 : 1e9
+  for (let r = 0; r < ny; r++)
+    for (let c = 0; c < nx; c++) {
+      const i = r * nx + c
+      if (!D[i]) continue
+      if (c === 0 || r === 0) { D[i] = 1; continue }
+      if (labels[i - 1] !== labels[i] || labels[i - nx] !== labels[i]) D[i] = 1
+      else D[i] = Math.min(D[i], D[i - 1] + 1, D[i - nx] + 1)
+    }
+  for (let r = ny - 1; r >= 0; r--)
+    for (let c = nx - 1; c >= 0; c--) {
+      const i = r * nx + c
+      if (!D[i]) continue
+      if (c === nx - 1 || r === ny - 1) { D[i] = 1; continue }
+      if (labels[i + 1] !== labels[i] || labels[i + nx] !== labels[i]) D[i] = Math.min(D[i], 1)
+      else D[i] = Math.min(D[i], D[i + 1] + 1, D[i + nx] + 1)
+    }
+  const out = new Map<number, number>()
+  for (let i = 0; i < N; i++) { const L = labels[i]; if (L >= 0 && 2 * D[i] * cs > (out.get(L) ?? 0)) out.set(L, 2 * D[i] * cs) }
+  return out
 }
 
 function labelAnchors(labels: Int32Array, g: GridSpec) {

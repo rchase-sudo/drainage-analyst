@@ -103,6 +103,10 @@ function importDXF(fileName: string, text: string): Drawing {
       }
     }
   }
+  // dxf-parser skips HATCH and MULTILEADER: read them from the raw text (fills are often the only cover outline,
+  // and contour / Tc labels are often multileaders)
+  ents.push(...scanHatchesAndLeaders(text, k))
+  labelContours(ents)
   if (!ents.length) throw new Error('No drawing entities found in this DXF.')
   return { fileName, source: 'dxf', units, toFt: k, ents, layers: [] }
 }
@@ -192,6 +196,118 @@ function importLandXML(fileName: string, text: string): Drawing {
   return { fileName, source: 'landxml', units, toFt: k, ents: [], layers: [], tin: { pts, tris } }
 }
 
+
+/* ---------- raw HATCH / MULTILEADER reader ---------- */
+function scanHatchesAndLeaders(text: string, k: number): Ent[] {
+  const out: Ent[] = []
+  const sec = text.search(/\n\s*ENTITIES\s*\r?\n/)
+  if (sec < 0) return out
+  const L = text.slice(sec).split(/\r?\n/)
+  let i = 0
+  const n = L.length - 1
+  while (i < n) {
+    const code = L[i].trim(), val = L[i + 1].trim()
+    if (code === '0' && val === 'ENDSEC') break
+    if (code === '0' && (val === 'HATCH' || val === 'MULTILEADER')) {
+      const kind = val
+      const tok: [number, string][] = []
+      i += 2
+      while (i < n && L[i].trim() !== '0') { tok.push([+L[i].trim(), L[i + 1].trim()]); i += 2 }
+      const layer = tok.find((t) => t[0] === 8)?.[1] ?? '0'
+      if (kind === 'MULTILEADER') {
+        const txt = tok.find((t) => t[0] === 304)?.[1]
+        if (!txt) continue
+        const p12 = tok.findIndex((t) => t[0] === 12)
+        const p10 = tok.findIndex((t) => t[0] === 10)
+        const pi = p12 >= 0 ? p12 : p10
+        if (pi < 0) continue
+        const x = parseFloat(tok[pi][1]), y = parseFloat(tok[pi + 1]?.[1] ?? '0')
+        out.push({ kind: 'text', layer, pts: [[x * k, y * k, 0]], text: txt.replace(/\\[A-Za-z][^;]*;|[{}]|\\P/g, ' ') })
+      } else {
+        for (const loop of hatchLoops(tok)) if (loop.length >= 3) out.push({ kind: 'poly', layer, pts: loop.map(([x, y]) => [x * k, y * k, 0]), closed: true, hasZ: false, hatch: true })
+      }
+      continue
+    }
+    i += 2
+  }
+  return out
+}
+
+function hatchLoops(tok: [number, string][]): [number, number][][] {
+  const loops: [number, number][][] = []
+  let p = tok.findIndex((t) => t[0] === 91)
+  if (p < 0) return loops
+  const nLoops = parseInt(tok[p][1])
+  p++
+  const num = (c: number) => { while (p < tok.length && tok[p][0] !== c) p++; return p < tok.length ? parseFloat(tok[p++][1]) : NaN }
+  for (let l = 0; l < nLoops && p < tok.length; l++) {
+    const flags = num(92)
+    const pts: [number, number][] = []
+    if (flags & 2) {
+      const hasBulge = num(72)
+      num(73)
+      const nv = num(93)
+      for (let v = 0; v < nv; v++) {
+        const x = num(10), y = num(20)
+        pts.push([x, y])
+        if (hasBulge && tok[p]?.[0] === 42) p++
+      }
+    } else {
+      const ne = num(93)
+      for (let e = 0; e < ne && p < tok.length; e++) {
+        const t = num(72)
+        if (t === 1) { const x = num(10), y = num(20); num(11); num(21); pts.push([x, y]) }
+        else if (t === 2 || t === 3) {
+          const cx = num(10), cy = num(20)
+          let r = 0, ry = 0
+          if (t === 2) { r = num(40); ry = r } else { const mx = num(11), my = num(21); r = Math.hypot(mx, my); ry = r * num(40) }
+          let a0 = (num(50) * Math.PI) / 180, a1 = (num(51) * Math.PI) / 180
+          const ccw = num(73)
+          if (!ccw) { const t0 = -a0; a0 = -a1; a1 = t0 }
+          if (a1 < a0) a1 += 2 * Math.PI
+          const m = Math.max(4, Math.ceil((a1 - a0) / (Math.PI / 12)))
+          for (let j = 0; j < m; j++) { const a = a0 + ((a1 - a0) * j) / m; pts.push([cx + r * Math.cos(a), cy + ry * Math.sin(a)]) }
+        } else if (t === 4) {
+          num(94); num(73); num(74)
+          const nk = num(95), nc = num(96)
+          for (let j = 0; j < nk; j++) num(40)
+          for (let j = 0; j < nc; j++) { const x = num(10), y = num(20); pts.push([x, y]) }
+        }
+      }
+    }
+    const ns = num(97)
+    for (let j = 0; j < ns; j++) if (tok[p]?.[0] === 330) p++
+    if (pts.every((q) => Number.isFinite(q[0]) && Number.isFinite(q[1]))) loops.push(pts)
+  }
+  return loops
+}
+
+/**
+ * Contours drawn without an elevation (plain polylines at z=0) take the value of the nearest numeric
+ * label on a contour layer — how most proposed grading is drafted.
+ */
+function labelContours(ents: Ent[]) {
+  const isCont = (l: string) => /CONT|TOPO|GRAD|\bFG\b|\bEG\b/i.test(l)
+  const flat = ents.filter((e) => e.kind === 'poly' && !e.hasZ && !e.closed && isCont(e.layer) && !/TEXT|LBL|LABEL/i.test(e.layer))
+  if (!flat.length) return
+  const labels = ents.filter((e) => e.kind === 'text' && isCont(e.layer)).map((e) => ({ x: e.pts[0][0], y: e.pts[0][1], z: parseFloat((e.text ?? '').replace(/[^0-9.\-]/g, ' ').trim().split(/\s+/)[0]) }))
+    .filter((t) => Number.isFinite(t.z) && /^\s*-?\d+(\.\d+)?\s*$/.test(String(t.z)))
+  if (!labels.length) return
+  for (const e of flat) {
+    let best = NaN, bd = 25
+    for (const t of labels) {
+      for (let i = 1; i < e.pts.length; i++) {
+        const a = e.pts[i - 1], b = e.pts[i]
+        const dx = b[0] - a[0], dy = b[1] - a[1], LL = dx * dx + dy * dy
+        const u = LL ? Math.max(0, Math.min(1, ((t.x - a[0]) * dx + (t.y - a[1]) * dy) / LL)) : 0
+        const dd = Math.hypot(t.x - a[0] - u * dx, t.y - a[1] - u * dy)
+        if (dd < bd) { bd = dd; best = t.z }
+      }
+    }
+    if (Number.isFinite(best)) { for (const p of e.pts) p[2] = best; e.hasZ = true }
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /*  Layer role detection                                                */
 /* ------------------------------------------------------------------ */
@@ -201,12 +317,14 @@ const RX = {
   study: /WATERSHED|STUDY|ANALYSIS.?(AREA|LIMIT|BOUND)|DRAIN(AGE)?.?AREA|LIMIT.?OF.?ANALYSIS|SUBCAT/,
   designpoint: /\bDP\b|DESIGN.?P(T|OINT)|\bPOA\b|POINT.?OF.?ANALYSIS|ANALYSIS.?P(T|OINT)/,
   soils: /SOIL|\bHSG\b/,
-  basin: /DETEN|BASIN|INFILTR|BIORET|RAIN.?GARDEN|\bBMP\b|STORMWATER.?(POND|AREA)|RETENTION|TREATMENT.?(SWALE|AREA)/,
+  site: /LIMIT.?OF.?(WORK|DISTURB|CLEAR|GRAD|CONST)|\bLOD\b|\bLOW\b|DISTURB|CLEARING.?LIMIT|\bPL\b|PROP.?LINE|PROPERTY.?LINE|\bBNDY\b|BOUNDARY.?LINE|LOT.?LINE|PARCEL.?LINE/,
+  basin: /DETEN|BASIN(?!.*SYM)|INFILTR|\bBIO\b|\bGSF\b|SOIL.?FILTER|SAND.?FILTER|GRAVEL.?WETLAND|BIORET|RAIN.?GARDEN|\bBMP\b|STORMWATER.?(POND|AREA)|RETENTION|TREATMENT.?(SWALE|AREA)/,
   storm: /STRM|STORM|\bSD\b|\bSTM\b|PIPE|CULV|CATCH|\bCB\b|INLET|DRAIN.?(LINE|STR)|DRAINAGE|\bDMH\b|OUTFALL|HEADWALL|\bFES\b/,
   surface: /CONT|TOPO|SURF|\bTIN\b|\bEG\b|\bFG\b|GRADE|GRADING|ELEV|SPOT|BRKL|BREAK|\bGROUND\b|\bGRND\b|MAJR|MINR/,
   roof: /BLDG|BUILDING|ROOF|HOUSE|GARAGE|SHED|BARN|DWELL|FOOTPRINT/,
   pavement: /PAVE|PVMT|ASPH|BITUM|\bBIT\b|CONC|DRIVE|DRWY|PARK|ROAD|STREET|\bST\b|SIDEWALK|\bSW\b|WALK|IMPERV|PATIO|HARDSCAPE|\bPAD\b|DECK/,
   gravel: /GRAVEL|GRVL|CRUSH|STONE.?(DRIVE|AREA)/,
+  dirt: /TRAIL|DIRT/,
   wetland: /WETL|\bWL\b|MARSH|BOG/,
   water: /WATER|POND|LAKE|STREAM|RIVER|BROOK|CREEK|\bEOW\b/,
   woods: /WOOD|TREE|FOREST|\bVEG|CANOPY/,
@@ -217,29 +335,46 @@ const RX = {
   pr: /(^|[^A-Z])(PR|PROP|PRP|PROPOSED|P|NEW)([^A-Z]|$)|PROPOS/,
 }
 
+// Lines on these layers never describe land cover even when the name mentions pavement, water, trees...
+const NOT_COVER = /SETBACK|BUFFER|BUFFE|HIGHLIGH|PROTECT|CONNECTOR|FOCUS|CONSERV|UNDEVELOP|HABITAT|SHOREBIRD|MNAP|WILD|ESSENTIAL|FARMLAND|VERNAL|RTE|WELL|\bROW\b|R O W|\bROD\b|\bCL\b|CENTER|C\/L|NAME|TEXT|\bTXT\b|LBL|LABEL|DIM|SHADE|HATCH|\bSYM|SYMB|FLAG|\bOH\b|OVERHANG|ZONE|FLOOD|EASE|LIMIT|PROFILE|GRID|STATION|\bSTA\b|LEADER|NOTE|MARKUP|LEGEND|DETAIL|XREF|VIEWPORT|BORD|TITLE|LOGO|NORTH|SITE.?EXP|AQUIF|SHELL|PARCEL|ABUT|TOWN|TIE|TRAVERSE|BRG|SIGN|STAIR|FENCE|GUARD.?RAIL|\bRAIL|WALL(?!K)|ELEC|GAS|SEWER|SEPT|WELL|WATER.?(PIPE|LINE|MAIN|SVC|SYM)|TEST|PIT|MON\b|BENCH|TBM|ARROW|SPOT/
+// Utility pipes are not storm drainage
+const UTILITY = /WATER.?(PIPE|LINE|MAIN|SVC|SERV)|\bGAS\b|SEWER|\bSAN\b|SANIT|ELEC|IRRIG|FORCE.?MAIN|SEPT|TELE|COMM|FIBER|CATV|LIGHT|PROPANE|\bWTR\b/
+const STORM_STRONG = /STRM|STORM|\bSD\b|\bSTM\b|CULV|CATCH|\bCB\b|INLET|DRAIN|\bDMH\b|OUTFALL|HEADWALL|\bFES\b|\bHW\b/
+// Surface layers: contours, TINs, spots — but not survey/boundary/symbol linework that happens to sit at an elevation
+const NOT_SURFACE = /BOUND|\bPL\b|PROP.?LINE|TEXT|LBL|LABEL|\bSYM|SYMB|ROCK|WALL|BLDG|PIPE|FLOOD|HIGH.?WATER|STREAM|WATER|TREE|TEST|PIT|MON\b|BORD|TITLE|NOTE|DIM|LEADER|ANGLE|BRG|PIN|IPF|TIE|TRAVERSE|ELEC|GAS|SEWER|PROPANE|SIGN/
+
 function guessRole(L: LayerInfo, condition: Condition): Role {
   const n = L.name.toUpperCase().replace(/[_\-.|$]/g, ' ')
   const isEx = RX.ex.test(n) && !RX.pr.test(n)
   const isPr = RX.pr.test(n) && !RX.ex.test(n)
+  const lines = L.polys ?? L.count - L.points - L.faces // polylines and lines, open or closed
+  const polysZ = L.polysZ ?? 0
 
-  if (RX.ignore.test(n) && !L.withZ) return 'ignore'
-  const lines = L.count - L.points - L.faces // polylines and lines, open or closed
-  if (RX.study.test(n)) return lines > 0 ? 'study' : 'reference'
-  if (RX.designpoint.test(n)) return 'designpoint'
-  if (RX.soils.test(n)) return 'soils'
-  if (RX.basin.test(n) && lines > 0) return condition === 'pre' ? 'reference' : 'basin'
-  if (RX.storm.test(n)) return condition === 'pre' && isPr ? 'reference' : 'storm'
-
-  const zHeavy = L.faces > 0 || (L.withZ > 0 && L.withZ >= 0.6 * (L.count - L.points))
-  if (RX.surface.test(n) || zHeavy) {
+  // surface first: contour/TIN layers with real elevations
+  const namedSurface = RX.surface.test(n) && !NOT_SURFACE.test(n.replace(/CONT/g, ''))
+  const zLines = polysZ >= 10 && polysZ >= 0.8 * Math.max(1, lines)
+  if (L.faces > 0 || (namedSurface && (polysZ > 0 || (L.withZ > 0 && /SPOT|ELEV|PNT|POINT|SHOT/.test(n)))) || (zLines && /CONT|TOPO|SURF|GRADE|GRAD|ELEV|\bEG\b|\bFG\b/.test(n))) {
     if (condition === 'pre') return isPr ? 'reference' : 'surface'
     return isEx ? 'surface-ex' : 'surface'
   }
-  if (lines > 0) {
+  if (RX.ignore.test(n) && !RX.soils.test(n)) return 'ignore'
+  if (RX.study.test(n)) return lines > 0 ? 'study' : 'reference'
+  if (lines > 0 && RX.site.test(n) && !/TEXT|LBL|LABEL|NOPLOT|SETBACK|ABUT|TIE|BRG|DIM|SYM/.test(n)) return 'site'
+  if (RX.designpoint.test(n)) return 'designpoint'
+  if (RX.soils.test(n)) return 'soils'
+  if (RX.basin.test(n) && lines > 0 && !NOT_COVER.test(n)) return condition === 'pre' ? 'reference' : 'basin'
+  if (STORM_STRONG.test(n) || (RX.storm.test(n) && !UTILITY.test(n))) {
+    if (UTILITY.test(n) && !/STRM|STORM|\bSD\b|CULV|DRAIN|CATCH|\bCB\b/.test(n)) return 'reference'
+    if (/TEXT|LBL|LABEL|NOTE|SHADE/.test(n)) return 'reference'
+    return (condition === 'pre' && isPr) || RX.demo.test(n) ? 'reference' : 'storm'
+  }
+  // hatch fills are good cover outlines even on *-HATCH / *-SHADE layers
+  const coverOk = !NOT_COVER.test(n) || ((L.hatches ?? 0) > 0 && !NOT_COVER.test(n.replace(/HATCH|SHADE/g, '')))
+  if (lines > 0 && coverOk) {
     const cov = (Object.keys(COVER_RX) as CoverKey[]).find((k) => COVER_RX[k].test(n))
     // demolished items never count; existing items drawn on the proposed plan still exist, so they count;
     // proposed items on the existing plan don't exist yet
-    if (cov) return RX.demo.test(n) || (condition === 'pre' && isPr) ? 'reference' : (`cover:${cov}` as Role)
+    if (cov) return (condition === 'post' && RX.demo.test(n)) || (condition === 'pre' && isPr) ? 'reference' : (`cover:${cov}` as Role)
   }
   return 'reference'
 }
@@ -247,6 +382,7 @@ function guessRole(L: LayerInfo, condition: Condition): Role {
 export const COVER_RX: Record<CoverKey, RegExp> = {
   roof: RX.roof,
   gravel: RX.gravel,
+  dirt: RX.dirt,
   pavement: RX.pavement,
   wetland: RX.wetland,
   water: RX.water,
@@ -259,8 +395,9 @@ function summarizeLayers(d: Drawing, condition: Condition): LayerInfo[] {
   const m = new Map<string, LayerInfo>()
   for (const e of d.ents) {
     let L = m.get(e.layer)
-    if (!L) m.set(e.layer, (L = { name: e.layer, count: 0, closed: 0, withZ: 0, faces: 0, points: 0, role: 'reference' }))
+    if (!L) m.set(e.layer, (L = { name: e.layer, count: 0, closed: 0, withZ: 0, faces: 0, points: 0, polys: 0, polysZ: 0, role: 'reference' }))
     L.count++
+    if (e.kind === 'poly') { L.polys!++; if (e.hasZ) L.polysZ!++; if (e.hatch) L.hatches = (L.hatches ?? 0) + 1 }
     if (e.kind === 'poly' && e.closed) L.closed++
     if (e.hasZ && e.kind !== 'text') L.withZ++
     if (e.kind === 'face') L.faces++
@@ -272,7 +409,7 @@ function summarizeLayers(d: Drawing, condition: Condition): LayerInfo[] {
   if (d.source === 'landxml') return []
   // Fallback: no surface layer detected → every layer with elevations becomes surface
   if (!layers.some((l) => l.role === 'surface' || l.role === 'surface-ex'))
-    for (const L of layers) if (L.withZ > 0 && L.role === 'reference') L.role = 'surface'
+    for (const L of layers) if ((L.polysZ ?? 0) > 0 && L.role === 'reference' && !NOT_SURFACE.test(L.name.toUpperCase())) L.role = 'surface'
   return layers.sort((a, b) => roleOrder(a.role) - roleOrder(b.role) || a.name.localeCompare(b.name))
 }
 
@@ -280,6 +417,7 @@ export const ROLE_LABELS: { role: Role; label: string }[] = [
   { role: 'surface', label: 'Surface (contours / TIN)' },
   { role: 'surface-ex', label: 'Existing surface (fill-in)' },
   { role: 'study', label: 'Study area limit' },
+  { role: 'site', label: 'Site limit (LOD / property line)' },
   { role: 'designpoint', label: 'Design point' },
   { role: 'storm', label: 'Storm drainage (CB, pipe, culvert)' },
   { role: 'basin', label: 'Stormwater basin' },
@@ -287,6 +425,7 @@ export const ROLE_LABELS: { role: Role; label: string }[] = [
   { role: 'cover:roof', label: 'Cover · Roof' },
   { role: 'cover:pavement', label: 'Cover · Pavement' },
   { role: 'cover:gravel', label: 'Cover · Gravel' },
+  { role: 'cover:dirt', label: 'Cover · Dirt road / trail' },
   { role: 'cover:grass', label: 'Cover · Grass / lawn' },
   { role: 'cover:meadow', label: 'Cover · Meadow / brush' },
   { role: 'cover:woods', label: 'Cover · Woods' },

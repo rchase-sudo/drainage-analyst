@@ -2,12 +2,13 @@ import type { Ring, XY } from './geometry'
 
 export type Condition = 'pre' | 'post'
 
-export type CoverKey = 'roof' | 'pavement' | 'gravel' | 'grass' | 'meadow' | 'woods' | 'water' | 'wetland'
+export type CoverKey = 'roof' | 'pavement' | 'gravel' | 'dirt' | 'grass' | 'meadow' | 'woods' | 'water' | 'wetland'
 
 export type Role =
   | 'surface'
   | 'surface-ex' // existing ground used only where the proposed surface has no data (post)
   | 'study'
+  | 'site' // limit of disturbance or property line: design points go where flow leaves it
   | 'soils'
   | 'storm'
   | 'designpoint'
@@ -27,6 +28,8 @@ export interface Ent {
   text?: string
   name?: string
   r?: number
+  /** boundary of a HATCH fill */
+  hatch?: boolean
 }
 
 export interface LayerInfo {
@@ -36,6 +39,10 @@ export interface LayerInfo {
   withZ: number
   faces: number
   points: number
+  /** polylines / lines, and how many of those carry an elevation */
+  polys?: number
+  polysZ?: number
+  hatches?: number
   role: Role
 }
 
@@ -64,6 +71,12 @@ export interface Settings {
   minTcMin: number
   minDPPercent: number // % of study area for a natural outfall to become its own design point
   targetCells: number
+  /** one subcatchment per receiving basin / design point for inlets, instead of one per inlet */
+  groupInlets?: boolean
+  /** road / drive edges act as drainage divides */
+  roadDivides?: boolean
+  /** HSG for soil map-unit symbols found on the plan (e.g. "238BH": "C") */
+  soilMap?: Record<string, 'A' | 'B' | 'C' | 'D'>
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -84,6 +97,8 @@ export const DEFAULT_SETTINGS: Settings = {
   minTcMin: 6,
   minDPPercent: 5,
   targetCells: 220000,
+  groupInlets: true,
+  roadDivides: true,
 }
 
 export interface TcSegment {
@@ -177,6 +192,8 @@ export interface AnalysisResult {
   labels: Int32Array // subcatchment index per cell (-1 none)
   coverGrid: Uint8Array // cover index per cell (255 = none)
   hsgGrid: Uint8Array // 0..3, 255 = none
+  /** soil map-unit symbols found without an HSG */
+  soilUnits?: { unit: string; hsg: string; areaAc: number }[]
   warnings: string[]
   timings: Record<string, number>
 }

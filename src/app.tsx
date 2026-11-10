@@ -70,6 +70,8 @@ export function App() {
         live.current.st = { ...live.current.st, [c]: { ...live.current.st[c], layers: m.layers, roles, files: m.files } }
         const preBusy = live.current.st.pre.status === 'loading' || live.current.st.pre.status === 'running'
         if (c === 'post' && preBusy) return // the pre result triggers post
+        // the proposed plan may carry the limit of disturbance the existing run should use: re-run existing first
+        if (c === 'post' && live.current.st.pre.files.length && m.layers.some((l) => l.role === 'site')) { run('pre'); return }
         run(c)
       } else if (m.type === 'progress') {
         if (m.id === latest.current[c]) patch(c, { msg: m.msg })
@@ -227,7 +229,7 @@ export function App() {
           <div class="panel results"><div class="note">Analyze both the existing and the proposed condition to compare them.</div></div>
         ))}
 
-      {drawer && <SettingsDrawer s={settings} onChange={applySettings} onClose={() => setDrawer(false)} />}
+      {drawer && <SettingsDrawer s={settings} units={[...(st.pre.result?.soilUnits ?? []), ...(st.post.result?.soilUnits ?? [])]} onChange={applySettings} onClose={() => setDrawer(false)} />}
 
       <div class="foot">
         <span>Preliminary analysis — TR-55 Tc (sheet + shallow concentrated by surface), CN from drawn cover and soils, SCS runoff, NRCS dimensionless unit hydrograph, level-pool basin routing. Verify before design submittal.</span>
@@ -363,7 +365,7 @@ function CondPanel(p: {
   )
 }
 
-function SettingsDrawer({ s, onChange, onClose }: { s: Settings; onChange: (s: Settings) => void; onClose: () => void }) {
+function SettingsDrawer({ s, units, onChange, onClose }: { s: Settings; units: { unit: string; areaAc: number }[]; onChange: (s: Settings) => void; onClose: () => void }) {
   const [d, setD] = useState<Settings>(s)
   const set = <K extends keyof Settings>(k: K, v: Settings[K]) => setD({ ...d, [k]: v })
   const num = (v: string, fb: number) => (Number.isFinite(parseFloat(v)) ? parseFloat(v) : fb)
@@ -405,6 +407,36 @@ function SettingsDrawer({ s, onChange, onClose }: { s: Settings; onChange: (s: S
         <div class="field"><span>Max sheet flow length (ft)</span><input type="number" value={d.sheetMax} onInput={(e) => set('sheetMax', num((e.target as HTMLInputElement).value, 100))} /></div>
         <div class="field"><span>Minimum Tc (min)</span><input type="number" step="0.5" value={d.minTcMin} onInput={(e) => set('minTcMin', num((e.target as HTMLInputElement).value, 6))} /></div>
         <div class="field"><span>New design point at (% of site)</span><input type="number" step="1" value={d.minDPPercent} onInput={(e) => set('minDPPercent', num((e.target as HTMLInputElement).value, 5))} /></div>
+        <div class="field"><span>Roads act as drainage divides</span>
+          <select value={d.roadDivides === false ? 'no' : 'yes'} onChange={(e) => set('roadDivides', (e.target as HTMLSelectElement).value === 'yes')}>
+            <option value="yes">Yes</option><option value="no">No</option>
+          </select>
+        </div>
+        <div class="field"><span>Group inlets by outfall</span>
+          <select value={d.groupInlets === false ? 'no' : 'yes'} onChange={(e) => set('groupInlets', (e.target as HTMLSelectElement).value === 'yes')}>
+            <option value="yes">One subcatchment per outfall</option><option value="no">One per inlet</option>
+          </select>
+        </div>
+        {(() => {
+          const seen = new Map<string, number>()
+          for (const u of units) seen.set(u.unit, (seen.get(u.unit) ?? 0) + u.areaAc)
+          for (const k of Object.keys(d.soilMap ?? {})) if (!seen.has(k)) seen.set(k, 0)
+          if (!seen.size) return null
+          return (
+            <>
+              <div class="eyebrow" style="margin-top:22px"><span>Soil map units → HSG</span></div>
+              <div class="note" style="margin-bottom:6px">Soil labels on the plan that aren't an HSG letter. Set the group from the soil survey.</div>
+              {[...seen.entries()].map(([u, ac]) => (
+                <div class="field"><span class="mono">{u}{ac ? ` · ${ac.toFixed(2)} ac` : ''}</span>
+                  <select value={d.soilMap?.[u] ?? ''} onChange={(e) => { const v = (e.target as HTMLSelectElement).value; const m = { ...(d.soilMap ?? {}) }; if (v) m[u] = v as 'A'; else delete m[u]; set('soilMap', m) }}>
+                    <option value="">Default ({d.defaultHSG})</option>
+                    {['A', 'B', 'C', 'D'].map((h) => <option value={h}>HSG {h}</option>)}
+                  </select>
+                </div>
+              ))}
+            </>
+          )
+        })()}
         <div class="field"><span>Resolution</span>
           <select value={String(d.targetCells)} onChange={(e) => set('targetCells', +(e.target as HTMLSelectElement).value)}>
             <option value="90000">Fast</option>
