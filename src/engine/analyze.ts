@@ -117,6 +117,8 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
   say('Mapping land cover and soils')
   const cover = new Uint8Array(N).fill(255)
   const hsg = new Uint8Array(N).fill(255)
+  // 0 = no linework (pervious default), 1 = drawn in this file, 2 = pervious cover carried from existing
+  const src = new Uint8Array(N)
   const carry = S.defaultCover === 'carry' || (condition === 'post' && !!opt.base)
   if (carry && opt.base) {
     const bg = opt.base.grid
@@ -124,12 +126,16 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
       if (!valid[i]) continue
       const c = Math.floor((cx(i) - bg.x0) / bg.cs), r = Math.floor((cy(i) - bg.y0) / bg.cs)
       if (c >= 0 && r >= 0 && c < bg.nx && r < bg.ny) {
-        cover[i] = opt.base.coverGrid[r * bg.nx + c]
         hsg[i] = opt.base.hsgGrid[r * bg.nx + c]
+        // impervious only ever comes from linework in this drawing, so only pervious cover carries over
+        const k: number = opt.base.coverGrid[r * bg.nx + c]
+        const key = COVER_KEYS[k]
+        if (key && !COVERS[key].imperv) { cover[i] = k; src[i] = 2 }
       }
     }
   }
-  const defCover = COVER_KEYS.indexOf(S.defaultCover === 'carry' ? 'woods' : S.defaultCover)
+  const defKey: CoverKey = S.defaultCover === 'carry' || COVERS[S.defaultCover]?.imperv ? 'woods' : S.defaultCover
+  const defCover = COVER_KEYS.indexOf(defKey)
   const PRIORITY: CoverKey[] = ['woods', 'meadow', 'wetland', 'water', 'grass', 'gravel', 'pavement', 'roof']
   const allTexts = d.ents.filter((e) => e.kind === 'text' && e.text)
   const coverFills: { k: number; area: number; apply: (fn: (i: number) => void) => void }[] = []
@@ -161,7 +167,7 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
   if (openCoverLayers) warnings.push(`Built land-cover shapes from open linework on ${openCoverLayers} cover class${openCoverLayers > 1 ? 'es' : ''}; closed versions are in the DXF export.`)
   // lower priority first, and larger first within a class so islands win
   coverFills.sort((a, b) => PRIORITY.indexOf(COVER_KEYS[a.k]) - PRIORITY.indexOf(COVER_KEYS[b.k]) || b.area - a.area)
-  for (const p of coverFills) p.apply((i) => { if (valid[i]) cover[i] = p.k })
+  for (const p of coverFills) p.apply((i) => { if (valid[i]) { cover[i] = p.k; src[i] = 1 } })
   for (let i = 0; i < N; i++) if (valid[i] && cover[i] === 255) cover[i] = defCover
 
   const soilEnts = byRole('soils')
@@ -537,28 +543,29 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
   say('Computing curve numbers')
   const U = unitKeys.length
   const cnt = new Float64Array(U)
-  const coverCount = new Map<string, number>() // `${u}|${cover}|${hsg}`
+  const coverCount = new Map<string, number>() // `${u}|${cover}|${hsg}|${src}`
   for (let i = 0; i < N; i++) {
     const u = labels[i]
     if (u < 0) continue
     cnt[u]++
-    const key = `${u}|${cover[i]}|${hsg[i]}`
+    const key = `${u}|${cover[i]}|${hsg[i]}|${src[i]}`
     coverCount.set(key, (coverCount.get(key) ?? 0) + 1)
   }
   const unitCovers: CoverRow[][] = Array.from({ length: U }, () => [])
   for (const [key, n] of coverCount) {
-    const [u, cvi, h] = key.split('|').map(Number)
+    const [u, cvi, h, sr] = key.split('|').map(Number)
     const ck = COVER_KEYS[cvi]
     const def = COVERS[ck]
-    unitCovers[u].push({ cover: ck, hsg: 'ABCD'[h], areaAc: n * cellAc, cn: def.cn[h], desc: def.desc })
+    const note = sr === 0 ? ' (no linework, pervious)' : sr === 2 ? ' (existing, undisturbed)' : ''
+    unitCovers[u].push({ cover: ck, hsg: 'ABCD'[h], areaAc: n * cellAc, cn: def.cn[h], desc: def.desc + note })
   }
 
   /* ---------------- time of concentration ---------------- */
   say('Tracing Tc paths')
   const P2 = Math.min(...S.storms.map((s) => s.P))
-  const chanCells = S.channelAcres / cellAc
   const stopAt = (i: number) => dir[i] < 0 || (basinOf[i] >= 0 && basinCell[i] >= 0)
-  const paved = (i: number) => COVERS[COVER_KEYS[cover[i]]]?.paved ?? false
+  // shallow concentrated velocity depends on the surface the flow crosses
+  const kv = (i: number) => COVERS[COVER_KEYS[cover[i]]]?.kv ?? 7
   const stepT = new Float64Array(N) // concentrated time to unit outlet (s)
   for (let k = order.length - 1; k >= 0; k--) {
     const i = order[k]
@@ -566,7 +573,7 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
     const j = dir[i]
     const L = dist(i, j)
     const s = Math.max(0.005, (z[i] - z[j]) / L)
-    const V = acc[i] >= chanCells ? (1.49 / S.channelN) * Math.pow(S.channelR, 2 / 3) * Math.sqrt(s) : (paved(i) ? 20.3282 : 16.1345) * Math.sqrt(s)
+    const V = kv(i) * Math.sqrt(s)
     stepT[i] = stepT[j] + L / V
   }
   function dist(i: number, j: number) {
@@ -581,7 +588,6 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
       if (L + dl > S.sheetMax + 1e-6) break
       L += dl
       cur = j
-      if (acc[cur] >= chanCells) break
     }
     return { end: cur, L }
   }
@@ -617,28 +623,29 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
     const total = cum[cum.length - 1]
     if (total <= 0) return { tc: 0, segs }
     let k0 = 0
-    // sheet
+    // sheet flow: first stretch of the path, up to the max sheet length
     let k1 = 0
-    while (k1 + 1 < path.length && cum[k1 + 1] <= S.sheetMax + 1e-6 && acc[path[k1 + 1]] < chanCells) k1++
+    while (k1 + 1 < path.length && cum[k1 + 1] <= S.sheetMax + 1e-6) k1++
     if (k1 > 0) {
       const L = cum[k1]
       const s = Math.max(0.005, (z[path[0]] - z[path[k1]]) / L)
-      const ck = COVER_KEYS[cover[path[0]]]
+      // Manning's n of the surface covering most of the sheet length
+      const tally = new Map<number, number>()
+      for (let k = 1; k <= k1; k++) tally.set(cover[path[k - 1]], (tally.get(cover[path[k - 1]]) ?? 0) + cum[k] - cum[k - 1])
+      const ck = COVER_KEYS[[...tally.entries()].sort((x, y) => y[1] - x[1])[0][0]]
       const n = COVERS[ck].sheetN
       const t = sheetTime(n, L, s)
       segs.push({ type: 'sheet', surface: COVERS[ck].desc.split(',')[0], L, s, n, V: L / t, t: t / 60, path: path.slice(0, k1 + 1).map(xy) })
       k0 = k1
     }
-    // shallow concentrated, split where paved/unpaved changes (min run 3 cells)
-    let kc = k0
-    while (kc < path.length - 1 && acc[path[kc]] < chanCells) kc++
-    // runs of paved / unpaved; runs shorter than 40 ft fold into their neighbour
-    const runs: { a: number; b: number; pv: boolean }[] = []
+    // shallow concentrated flow to the outlet, split where the surface changes (runs under 40 ft fold into a neighbour)
+    const kc = path.length - 1
+    const runs: { a: number; b: number; k: number }[] = []
     for (let a = k0; a < kc; ) {
-      const pv = paved(path[a])
+      const kk = kv(path[a])
       let b = a + 1
-      while (b < kc && paved(path[b]) === pv) b++
-      runs.push({ a, b, pv })
+      while (b < kc && kv(path[b]) === kk) b++
+      runs.push({ a, b, k: kk })
       a = b
     }
     for (let changed = true; changed && runs.length > 1; ) {
@@ -654,20 +661,15 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
         changed = true
       }
       for (let i = runs.length - 1; i > 0; i--)
-        if (runs[i].pv === runs[i - 1].pv) { runs[i - 1].b = runs[i].b; runs.splice(i, 1); changed = true }
+        if (runs[i].k === runs[i - 1].k) { runs[i - 1].b = runs[i].b; runs.splice(i, 1); changed = true }
     }
-    for (const { a, b, pv } of runs) {
+    for (const { a, b, k } of runs) {
       const L = cum[b] - cum[a]
       if (L <= 0) continue
       const s = Math.max(0.005, (z[path[a]] - z[path[b]]) / L)
-      const V = (pv ? 20.3282 : 16.1345) * Math.sqrt(s)
-      segs.push({ type: 'shallow', surface: pv ? 'Paved' : 'Unpaved', L, s, V, t: L / V / 60, path: path.slice(a, b + 1).map(xy) })
-    }
-    if (kc < path.length - 1) {
-      const L = cum[path.length - 1] - cum[kc]
-      const s = Math.max(0.005, (z[path[kc]] - z[path[path.length - 1]]) / L)
-      const V = (1.49 / S.channelN) * Math.pow(S.channelR, 2 / 3) * Math.sqrt(s)
-      segs.push({ type: 'channel', surface: `Channel n=${S.channelN}`, L, s, n: S.channelN, V, t: L / V / 60, path: path.slice(kc).map(xy) })
+      const V = k * Math.sqrt(s)
+      const desc = COVERS[COVER_KEYS.find((c) => COVERS[c].kv === k) ?? 'grass'].kvDesc
+      segs.push({ type: 'shallow', surface: `${desc} Kv=${k.toFixed(1)}`, L, s, V, t: L / V / 60, path: path.slice(a, b + 1).map(xy) })
     }
     return { tc: segs.reduce((x, s) => x + s.t, 0), segs }
   }
@@ -1200,7 +1202,7 @@ function hillshade(z: Float64Array, valid: Uint8Array, g: GridSpec, zmin: number
 function mergeCovers(rows: CoverRow[]) {
   const m = new Map<string, CoverRow>()
   for (const r of rows) {
-    const k = `${r.cover}|${r.hsg}`
+    const k = `${r.cover}|${r.hsg}|${r.desc}`
     const e = m.get(k)
     if (e) e.areaAc += r.areaAc
     else m.set(k, { ...r })

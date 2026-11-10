@@ -230,7 +230,7 @@ export function App() {
       {drawer && <SettingsDrawer s={settings} onChange={applySettings} onClose={() => setDrawer(false)} />}
 
       <div class="foot">
-        <span>Preliminary analysis — NRCS TR-55 Tc, SCS runoff, NRCS dimensionless unit hydrograph, level-pool basin routing. Verify before design submittal.</span>
+        <span>Preliminary analysis — TR-55 Tc (sheet + shallow concentrated by surface), CN from drawn cover and soils, SCS runoff, NRCS dimensionless unit hydrograph, level-pool basin routing. Verify before design submittal.</span>
         <span>© Apollo Development</span>
       </div>
     </div>
@@ -397,15 +397,12 @@ function SettingsDrawer({ s, onChange, onClose }: { s: Settings; onChange: (s: S
             {['A', 'B', 'C', 'D'].map((h) => <option>{h}</option>)}
           </select>
         </div>
-        <div class="field"><span>Undrawn cover (existing)</span>
+        <div class="field"><span>Area with no cover linework</span>
           <select value={d.defaultCover} onChange={(e) => set('defaultCover', (e.target as HTMLSelectElement).value as Settings['defaultCover'])}>
-            {COVER_KEYS.map((k) => <option value={k}>{COVERS[k].desc}</option>)}
+            {COVER_KEYS.filter((k) => !COVERS[k].imperv).map((k) => <option value={k}>{COVERS[k].desc}</option>)}
           </select>
         </div>
         <div class="field"><span>Max sheet flow length (ft)</span><input type="number" value={d.sheetMax} onInput={(e) => set('sheetMax', num((e.target as HTMLInputElement).value, 100))} /></div>
-        <div class="field"><span>Channel starts at (ac)</span><input type="number" step="0.5" value={d.channelAcres} onInput={(e) => set('channelAcres', num((e.target as HTMLInputElement).value, 5))} /></div>
-        <div class="field"><span>Channel Manning's n</span><input type="number" step="0.005" value={d.channelN} onInput={(e) => set('channelN', num((e.target as HTMLInputElement).value, 0.035))} /></div>
-        <div class="field"><span>Channel hydraulic radius (ft)</span><input type="number" step="0.1" value={d.channelR} onInput={(e) => set('channelR', num((e.target as HTMLInputElement).value, 0.5))} /></div>
         <div class="field"><span>Minimum Tc (min)</span><input type="number" step="0.5" value={d.minTcMin} onInput={(e) => set('minTcMin', num((e.target as HTMLInputElement).value, 6))} /></div>
         <div class="field"><span>New design point at (% of site)</span><input type="number" step="1" value={d.minDPPercent} onInput={(e) => set('minDPPercent', num((e.target as HTMLInputElement).value, 5))} /></div>
         <div class="field"><span>Resolution</span>

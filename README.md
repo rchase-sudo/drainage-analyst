@@ -5,7 +5,7 @@ plan and a proposed-conditions plan (ASCII DXF, or a LandXML TIN plus a DXF) and
 
 - Subcatchments delineated from the surface (D8 flow on a depression-conditioned grid)
 - Design points found automatically where flow leaves the site; the same points are reused for post
-- Tc paths traced along the longest travel-time route, split into TR-55 sheet / shallow concentrated / channel segments
+- Tc paths traced along the longest travel-time route: sheet flow, then shallow concentrated flow at a speed set by the surface (faster on pavement, slower on grass and woods)
 - Weighted curve numbers from land-cover and soil polygons (TR-55 Tables 2-2a/2-2c)
 - NRCS Type III (or II) 24-hr hydrographs using the NRCS dimensionless unit hydrograph
 - Pipe networks, culverts and catch basins: each inlet gets its own subcatchment, routed through its pipe to the outfall
@@ -19,7 +19,7 @@ plan and a proposed-conditions plan (ASCII DXF, or a LandXML TIN plus a DXF) and
 | Role | Layer names that are recognized |
 | --- | --- |
 | Surface | `CONT`, `TOPO`, `SURF`, `TIN`, `EG`, `FG`, `GRADE`, spot elevations; any layer whose objects carry elevations; 3DFACE TINs |
-| Existing vs proposed | `EX`/`EXIST` vs `PR`/`PROP` tokens. In the proposed file, existing contours fill in outside the graded area |
+| Existing vs proposed | `EX`/`EXIST` vs `PR`/`PROP` tokens. In the proposed file, existing contours fill in outside the graded area and existing cover still counts; `DEMO`/`REMOVE` layers are ignored |
 | Cover | `BLDG`/`ROOF`, `PAVE`/`ASPH`/`CONC`/`DRIVE`/`PARK`, `GRAVEL`, `LAWN`/`GRASS`/`LOAM`, `MEADOW`/`BRUSH`, `WOOD`/`TREE`, `WATER`/`POND`, `WETLAND` |
 | Soils | `SOIL`/`HSG` boundary lines with a text label like `HSG C` in each soil area |
 | Storm drainage | `STORM`/`STRM`/`SD`/`PIPE`/`CULV`/`CB`/`INLET` — blocks or circles are structures, lines are pipes. `FES`/`HW` = end sections, `MH`/`DMH` = junctions, `OCS` = basin outlet |
@@ -33,7 +33,14 @@ runs off the drawing (a tree line, a soil boundary), the side carrying a label (
 layer's symbols is used. Every shape the analysis used comes back as a closed polyline in the DXF export
 (`APL-EX-COVER-*`, `APL-EX-SOILS-HSG-*`, basins, subcatchments).
 
-Undrawn proposed cover and soils carry forward from the existing condition.
+Impervious area comes only from roof and pavement linework present in the drawing; anything without cover
+linework is pervious (woods by default, changeable in settings). Each subcatchment's CN is the area-weighted
+CN of the cover and soil linework inside it. In the proposed condition, undrawn areas keep the existing
+pervious cover and soils.
+
+Tc is computed for every subcatchment along its longest travel-time path: TR-55 sheet flow for the first
+100 ft (Manning's n of the surface it crosses), then shallow concentrated flow with a velocity factor for the
+surface underneath (V = Kv·√s: paved 20.3, gravel 16.1, grass/meadow 7.0, woods 5.0), split wherever the surface changes.
 
 ## Develop
 

@@ -212,6 +212,7 @@ const RX = {
   woods: /WOOD|TREE|FOREST|\bVEG|CANOPY/,
   meadow: /MEADOW|FIELD|BRUSH|SCRUB|PASTURE|SHRUB/,
   grass: /GRASS|LAWN|TURF|LANDSCAP|LOAM|SEED|OPEN.?SPACE|PERVIOUS|PLANT/,
+  demo: /DEMO|REMOV|\bRMV\b|\bTBR\b|RAZE|TO BE REM/,
   ex: /(^|[^A-Z])(EX|EXIST|EXST|EXG|EXT|E)([^A-Z]|$)|EXIST/,
   pr: /(^|[^A-Z])(PR|PROP|PRP|PROPOSED|P|NEW)([^A-Z]|$)|PROPOS/,
 }
@@ -220,7 +221,6 @@ function guessRole(L: LayerInfo, condition: Condition): Role {
   const n = L.name.toUpperCase().replace(/[_\-.|$]/g, ' ')
   const isEx = RX.ex.test(n) && !RX.pr.test(n)
   const isPr = RX.pr.test(n) && !RX.ex.test(n)
-  const wrongPhase = (condition === 'pre' && isPr) || (condition === 'post' && isEx)
 
   if (RX.ignore.test(n) && !L.withZ) return 'ignore'
   const lines = L.count - L.points - L.faces // polylines and lines, open or closed
@@ -237,7 +237,9 @@ function guessRole(L: LayerInfo, condition: Condition): Role {
   }
   if (lines > 0) {
     const cov = (Object.keys(COVER_RX) as CoverKey[]).find((k) => COVER_RX[k].test(n))
-    if (cov) return wrongPhase ? 'reference' : (`cover:${cov}` as Role)
+    // demolished items never count; existing items drawn on the proposed plan still exist, so they count;
+    // proposed items on the existing plan don't exist yet
+    if (cov) return RX.demo.test(n) || (condition === 'pre' && isPr) ? 'reference' : (`cover:${cov}` as Role)
   }
   return 'reference'
 }

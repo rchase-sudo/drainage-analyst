@@ -291,7 +291,6 @@ export function MapView({ result, selected, onSelect, emptyTitle, emptyText, sna
           <div class="legend">
             <span><i style="border-color:var(--amber);border-top-style:dashed" />Sheet</span>
             <span><i style="border-color:var(--violet)" />Shallow conc.</span>
-            <span><i style="border-color:var(--mint);border-top-width:3px" />Channel</span>
             <span style="color:var(--amber)">◆ Design point</span>
             <span style="color:var(--mint)">■ Inlet</span>
           </div>
