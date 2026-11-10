@@ -1,5 +1,7 @@
 import Delaunator from 'delaunator'
+import { COVER_RX } from './importer'
 import {
+  autoClose, regionsFromLinework,
   GridSpec, MinHeap, Ring, XY, centroid, pointInRing, polyArea, rasterizeRing, ringBBox, simplify, simplifyRing, traceLabels,
 } from './geometry'
 import {
@@ -43,7 +45,8 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
   if (!prim.pts.length && !prim.faces.length && !sec.pts.length && !sec.faces.length && !opt.base?.z)
     throw new Error('No elevation data found. Assign your contour, TIN, or spot-elevation layers the "Surface" role.')
 
-  const studyRings = byRole('study').filter((e) => e.kind === 'poly' && e.closed).map(toRing)
+  const studyShapes = shapesOf(byRole('study'))
+  const studyRings = studyShapes.rings
   let bb = extent([...prim.pts, ...sec.pts, ...prim.faces.flat()])
   if (!Number.isFinite(bb.x0) && opt.base) {
     const g = opt.base.grid
@@ -52,8 +55,8 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
     const g = opt.base.grid
     bb = { x0: Math.min(bb.x0, g.x0), y0: Math.min(bb.y0, g.y0), x1: Math.max(bb.x1, g.x0 + g.nx * g.cs), y1: Math.max(bb.y1, g.y0 + g.ny * g.cs) }
   }
-  if (studyRings.length) {
-    const sb = extent(studyRings.flat().map((p) => [p[0], p[1], 0] as V3))
+  if (studyRings.length || studyShapes.open.length) {
+    const sb = extent([...studyRings.flat(), ...studyShapes.open.flat()].map((p) => [p[0], p[1], 0] as V3))
     bb = { x0: Math.max(bb.x0, sb.x0), y0: Math.max(bb.y0, sb.y0), x1: Math.min(bb.x1, sb.x1), y1: Math.min(bb.y1, sb.y1) }
   }
   const area = (bb.x1 - bb.x0) * (bb.y1 - bb.y0)
@@ -97,8 +100,13 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
 
   // study mask
   const valid = new Uint8Array(N)
-  if (studyRings.length) for (const r of studyRings) rasterizeRing(r, grid, (i) => { if (!Number.isNaN(z[i])) valid[i] = 1 })
-  else for (let i = 0; i < N; i++) valid[i] = Number.isNaN(z[i]) ? 0 : 1
+  if (studyRings.length || studyShapes.open.length) {
+    for (const r of studyRings) rasterizeRing(r, grid, (i) => { if (!Number.isNaN(z[i])) valid[i] = 1 })
+    if (studyShapes.open.length) {
+      const reg = regionsFromLinework([...studyShapes.open, ...studyRings.map(closeRing)], grid)
+      for (let i = 0; i < N; i++) if (reg.blob[i] >= 0 && !Number.isNaN(z[i])) valid[i] = 1
+    }
+  } else for (let i = 0; i < N; i++) valid[i] = Number.isNaN(z[i]) ? 0 : 1
   let nValid = 0, zmin = Infinity, zmax = -Infinity
   for (let i = 0; i < N; i++) if (valid[i]) { nValid++; if (z[i] < zmin) zmin = z[i]; if (z[i] > zmax) zmax = z[i] }
   if (nValid < 50) throw new Error('The surface covers too little area to analyze.')
@@ -123,37 +131,70 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
   }
   const defCover = COVER_KEYS.indexOf(S.defaultCover === 'carry' ? 'woods' : S.defaultCover)
   const PRIORITY: CoverKey[] = ['woods', 'meadow', 'wetland', 'water', 'grass', 'gravel', 'pavement', 'roof']
-  const coverPolys: { k: number; ring: Ring; area: number }[] = []
-  for (const e of d.ents) {
-    const r = role(e)
-    if (!r.startsWith('cover:') || e.kind !== 'poly' || !e.closed) continue
-    const key = r.slice(6) as CoverKey
-    const ring = toRing(e)
-    coverPolys.push({ k: COVER_KEYS.indexOf(key), ring, area: Math.abs(polyArea(ring)) })
+  const allTexts = d.ents.filter((e) => e.kind === 'text' && e.text)
+  const coverFills: { k: number; area: number; apply: (fn: (i: number) => void) => void }[] = []
+  let openCoverLayers = 0
+  for (const key of COVER_KEYS) {
+    const ents = d.ents.filter((e) => role(e) === `cover:${key}`)
+    if (!ents.length) continue
+    const k = COVER_KEYS.indexOf(key)
+    const sh = shapesOf(ents)
+    for (const ring of sh.rings) coverFills.push({ k, area: Math.abs(polyArea(ring)), apply: (fn) => rasterizeRing(ring, grid, fn) })
+    if (!sh.open.length) continue
+    // open linework: enclosed areas become shapes; open-ended areas count only when a label or symbol says so
+    openCoverLayers++
+    const reg = regionsFromLinework([...sh.open, ...sh.rings.map(closeRing)], grid)
+    const votes = new Map<number, number>()
+    const vote = (x: number, y: number) => { const c = cellAt(x, y); if (c >= 0 && reg.comp[c] >= 0) votes.set(reg.comp[c], (votes.get(reg.comp[c]) ?? 0) + 1) }
+    for (const t of allTexts) if (COVER_RX[key].test((t.text ?? '').toUpperCase())) vote(t.pts[0][0], t.pts[0][1])
+    for (const e of ents) if (e.kind === 'insert' || e.kind === 'circle' || e.kind === 'point') vote(e.pts[0][0], e.pts[0][1])
+    const take = new Uint8Array(N)
+    let n = 0
+    for (let i = 0; i < N; i++) {
+      const c = reg.comp[i]
+      if (c < 0) continue
+      if (!reg.exterior[c] || votes.has(c)) { take[i] = 1; n++ }
+    }
+    if (!n) { warnings.push(`Open linework on ${[...new Set(ents.map((e) => e.layer))].join(', ')} encloses no area; add a "${key.toUpperCase()}" label on the correct side.`); continue }
+    coverFills.push({ k, area: n * cs * cs, apply: (fn) => { for (let i = 0; i < N; i++) if (take[i]) fn(i) } })
   }
+  if (openCoverLayers) warnings.push(`Built land-cover shapes from open linework on ${openCoverLayers} cover class${openCoverLayers > 1 ? 'es' : ''}; closed versions are in the DXF export.`)
   // lower priority first, and larger first within a class so islands win
-  coverPolys.sort((a, b) => PRIORITY.indexOf(COVER_KEYS[a.k]) - PRIORITY.indexOf(COVER_KEYS[b.k]) || b.area - a.area)
-  for (const p of coverPolys) rasterizeRing(p.ring, grid, (i) => { if (valid[i]) cover[i] = p.k })
+  coverFills.sort((a, b) => PRIORITY.indexOf(COVER_KEYS[a.k]) - PRIORITY.indexOf(COVER_KEYS[b.k]) || b.area - a.area)
+  for (const p of coverFills) p.apply((i) => { if (valid[i]) cover[i] = p.k })
   for (let i = 0; i < N; i++) if (valid[i] && cover[i] === 255) cover[i] = defCover
 
   const soilEnts = byRole('soils')
-  const soilPolys = soilEnts.filter((e) => e.kind === 'poly' && e.closed).map(toRing)
-  const soilLabels = soilEnts.filter((e) => e.kind === 'text').map((e) => ({ x: e.pts[0][0], y: e.pts[0][1], g: parseHSG(e.text ?? '') })).filter((t) => t.g >= 0)
-  let soilHits = 0
-  for (const ring of soilPolys.sort((a, b) => Math.abs(polyArea(b)) - Math.abs(polyArea(a)))) {
-    const lab = soilLabels.find((t) => pointInRing(t.x, t.y, ring))
-    if (!lab) continue
-    soilHits++
-    rasterizeRing(ring, grid, (i) => { if (valid[i]) hsg[i] = lab.g })
+  const soilSh = shapesOf(soilEnts)
+  if (soilSh.rings.length || soilSh.open.length) {
+    const reg = regionsFromLinework([...soilSh.open, ...soilSh.rings.map(closeRing)], grid)
+    const labs = [...soilEnts.filter((e) => e.kind === 'text'), ...allTexts.filter((t) => /HSG/i.test(t.text ?? '') && role(t) !== 'soils')]
+    const hsgOf = new Map<number, number>()
+    for (const t of labs) {
+      const g = parseHSG(t.text ?? '')
+      const c = cellAt(t.pts[0][0], t.pts[0][1])
+      if (g >= 0 && c >= 0 && reg.comp[c] >= 0 && !hsgOf.has(reg.comp[c])) hsgOf.set(reg.comp[c], g)
+    }
+    if (!hsgOf.size) warnings.push('Soil linework found but no HSG labels (e.g. "HSG C") inside it; default HSG used.')
+    for (let i = 0; i < N; i++) if (valid[i] && reg.comp[i] >= 0) { const g = hsgOf.get(reg.comp[i]); if (g != null) hsg[i] = g }
   }
-  if (soilPolys.length && !soilHits) warnings.push('Soil polygons found but no HSG labels (e.g. "HSG C") inside them; default HSG used.')
   const defH = 'ABCD'.indexOf(S.defaultHSG)
   for (let i = 0; i < N; i++) if (valid[i] && hsg[i] === 255) hsg[i] = defH
   mark('cover')
 
   /* ---------------- storm features ---------------- */
   say('Reading drainage structures')
-  const basinsIn = byRole('basin').filter((e) => e.kind === 'poly' && e.closed).map(toRing).filter((r) => Math.abs(polyArea(r)) > 4 * cs * cs)
+  const basinSh = shapesOf(byRole('basin'))
+  const basinsIn = basinSh.rings.slice()
+  if (basinSh.open.length) {
+    const reg = regionsFromLinework([...basinSh.open, ...basinSh.rings.map(closeRing)], grid)
+    const traced = traceLabels(reg.blob, grid)
+    for (const [, parts] of traced) for (const p of parts) {
+      const r = simplifyRing(p.outer, cs)
+      if (!basinsIn.some((b) => pointInRing(r[0][0], r[0][1], b))) basinsIn.push(r)
+    }
+  }
+  for (let b = basinsIn.length - 1; b >= 0; b--) if (Math.abs(polyArea(basinsIn[b])) <= 4 * cs * cs) basinsIn.splice(b, 1)
   const basinCell = new Int32Array(N).fill(-1)
   basinsIn.forEach((r, b) => rasterizeRing(r, grid, (i) => { if (valid[i]) basinCell[i] = b }))
   const inBasin = (x: number, y: number) => basinsIn.findIndex((r) => pointInRing(x, y, r))
@@ -891,6 +932,25 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
 }
 
 /* ======================================================================= */
+
+/** Closed rings (drawn closed or nearly closed) and the remaining open linework of a set of entities. */
+function shapesOf(ents: Ent[]) {
+  const rings: Ring[] = []
+  const open: XY[][] = []
+  for (const e of ents) {
+    if (e.kind !== 'poly') continue
+    if (e.closed) { const r = toRing(e); if (r.length >= 3) rings.push(r); continue }
+    const pts = e.pts.map((p) => [p[0], p[1]] as XY)
+    const c = autoClose(pts)
+    if (c) rings.push(c)
+    else open.push(pts)
+  }
+  return { rings, open }
+}
+
+function closeRing(r: Ring): XY[] {
+  return [...r, r[0]]
+}
 
 function toRing(e: Ent): Ring {
   const r = e.pts.map((p) => [p[0], p[1]] as XY)

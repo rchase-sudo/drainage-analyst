@@ -275,7 +275,7 @@ function CondPanel(p: {
             onDrop={(e) => { e.preventDefault(); setOver(false); p.onFiles([...(e.dataTransfer?.files ?? [])]) }}
           >
             <div class="big">Drop the {label} plan</div>
-            <div class="small">DXF with contours, cover and drainage — or a LandXML TIN plus a DXF. Analysis runs on drop.</div>
+            <div class="small">DXF with contours, cover and drainage (open or closed linework) — or a LandXML TIN plus a DXF. Analysis runs on drop.</div>
             <input ref={input} type="file" accept=".dxf,.xml" multiple hidden onChange={(e) => p.onFiles([...((e.target as HTMLInputElement).files ?? [])])} />
           </div>
           {s.files.length > 0 && (

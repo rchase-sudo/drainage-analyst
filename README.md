@@ -20,12 +20,18 @@ plan and a proposed-conditions plan (ASCII DXF, or a LandXML TIN plus a DXF) and
 | --- | --- |
 | Surface | `CONT`, `TOPO`, `SURF`, `TIN`, `EG`, `FG`, `GRADE`, spot elevations; any layer whose objects carry elevations; 3DFACE TINs |
 | Existing vs proposed | `EX`/`EXIST` vs `PR`/`PROP` tokens. In the proposed file, existing contours fill in outside the graded area |
-| Cover | `BLDG`/`ROOF`, `PAVE`/`ASPH`/`CONC`/`DRIVE`/`PARK`, `GRAVEL`, `LAWN`/`GRASS`/`LOAM`, `MEADOW`/`BRUSH`, `WOOD`/`TREE`, `WATER`/`POND`, `WETLAND` (closed polylines) |
-| Soils | `SOIL`/`HSG` closed polylines with a text label like `HSG C` inside |
+| Cover | `BLDG`/`ROOF`, `PAVE`/`ASPH`/`CONC`/`DRIVE`/`PARK`, `GRAVEL`, `LAWN`/`GRASS`/`LOAM`, `MEADOW`/`BRUSH`, `WOOD`/`TREE`, `WATER`/`POND`, `WETLAND` |
+| Soils | `SOIL`/`HSG` boundary lines with a text label like `HSG C` in each soil area |
 | Storm drainage | `STORM`/`STRM`/`SD`/`PIPE`/`CULV`/`CB`/`INLET` — blocks or circles are structures, lines are pipes. `FES`/`HW` = end sections, `MH`/`DMH` = junctions, `OCS` = basin outlet |
-| Basin | `DETENTION`, `BASIN`, `INFILTRATION`, `BIORETENTION`, `BMP` (closed polyline at the basin rim) |
+| Basin | `DETENTION`, `BASIN`, `INFILTRATION`, `BIORETENTION`, `BMP` (outline at the basin rim) |
 | Design point | `DP`, `POA`, `DESIGN POINT` (optional — found automatically otherwise) |
-| Study area | `WATERSHED`, `STUDY AREA`, `DRAINAGE AREA` (optional closed polyline that clips the analysis) |
+| Study area | `WATERSHED`, `STUDY AREA`, `DRAINAGE AREA` (optional outline that clips the analysis) |
+
+Linework does not need to be closed. Nearly-closed polylines are closed automatically; open lines, exploded
+LINEs and pieces drawn in segments are treated as boundaries and the enclosed areas become shapes. Where a line
+runs off the drawing (a tree line, a soil boundary), the side carrying a label (`WOODED`, `HSG C`, …) or the
+layer's symbols is used. Every shape the analysis used comes back as a closed polyline in the DXF export
+(`APL-EX-COVER-*`, `APL-EX-SOILS-HSG-*`, basins, subcatchments).
 
 Undrawn proposed cover and soils carry forward from the existing condition.
 

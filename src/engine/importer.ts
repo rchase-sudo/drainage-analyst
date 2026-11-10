@@ -223,10 +223,11 @@ function guessRole(L: LayerInfo, condition: Condition): Role {
   const wrongPhase = (condition === 'pre' && isPr) || (condition === 'post' && isEx)
 
   if (RX.ignore.test(n) && !L.withZ) return 'ignore'
-  if (RX.study.test(n)) return L.closed ? 'study' : 'reference'
+  const lines = L.count - L.points - L.faces // polylines and lines, open or closed
+  if (RX.study.test(n)) return lines > 0 ? 'study' : 'reference'
   if (RX.designpoint.test(n)) return 'designpoint'
   if (RX.soils.test(n)) return 'soils'
-  if (RX.basin.test(n) && L.closed) return condition === 'pre' ? 'reference' : 'basin'
+  if (RX.basin.test(n) && lines > 0) return condition === 'pre' ? 'reference' : 'basin'
   if (RX.storm.test(n)) return condition === 'pre' && isPr ? 'reference' : 'storm'
 
   const zHeavy = L.faces > 0 || (L.withZ > 0 && L.withZ >= 0.6 * (L.count - L.points))
@@ -234,14 +235,14 @@ function guessRole(L: LayerInfo, condition: Condition): Role {
     if (condition === 'pre') return isPr ? 'reference' : 'surface'
     return isEx ? 'surface-ex' : 'surface'
   }
-  if (L.closed > 0) {
+  if (lines > 0) {
     const cov = (Object.keys(COVER_RX) as CoverKey[]).find((k) => COVER_RX[k].test(n))
     if (cov) return wrongPhase ? 'reference' : (`cover:${cov}` as Role)
   }
   return 'reference'
 }
 
-const COVER_RX: Record<CoverKey, RegExp> = {
+export const COVER_RX: Record<CoverKey, RegExp> = {
   roof: RX.roof,
   gravel: RX.gravel,
   pavement: RX.pavement,

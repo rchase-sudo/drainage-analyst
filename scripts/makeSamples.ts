@@ -114,12 +114,13 @@ function common(w: DxfWriter, phase: 'EX' | 'PR') {
   // road along the south edge
   w.polyline('EX-PAVEMENT', rect(0, 0, W, 34), true)
   // soils: HSG B upslope (west), HSG C east/low
-  w.polyline('SOILS', [[0, 0], [300, 0], [380, H], [0, H]], true)
-  w.text('SOILS', [120, 420], 8, 'HSG B')
-  w.polyline('SOILS', [[300, 0], [W, 0], [W, H], [380, H]], true)
-  w.text('SOILS', [520, 300], 8, 'HSG C')
+  // soil boundary drawn as a single open line across the site (as on a web-soil-survey overlay)
+  w.polyline('SOILS', [[300, -10], [340, 240], [380, H + 10]], false)
+  w.text('SOILS', [120, 420], 8, '26B HSG B')
+  w.text('SOILS', [520, 300], 8, '42C HSG C')
   // existing house + gravel drive on the west side
-  w.polyline('EX-BLDG', rect(70, 90, 115, 125), true)
+  const hb = rect(70, 90, 115, 125)
+  hb.forEach((p, i) => w.line('EX-BLDG', p, hb[(i + 1) % 4])) // exploded lines, not a polyline
   w.polyline('EX-GRAVEL-DRIVE', rect(85, 34, 100, 90), true)
   w.polyline('EX-LAWN', rect(50, 60, 140, 150), true)
   // existing culvert under the road at the swale
@@ -138,8 +139,11 @@ mkdirSync('public/samples', { recursive: true })
   const w = new DxfWriter()
   addContours(w, zEx, 'EX')
   common(w, 'EX')
-  w.polyline('EX-WOODS', [[0, 34], [W, 34], [W, H], [0, H]], true)
-  w.polyline('EX-MEADOW', rect(380, 260, 600, 440), true)
+  // tree line along the road, open ended; the label tells which side is wooded
+  w.polyline('EX-TREELINE', [[-5, 40], [200, 44], [420, 38], [W + 5, 42]], false)
+  w.text('EX-TEXT', [300, 300], 10, 'WOODED')
+  // meadow drawn with a small gap at the close
+  w.polyline('EX-MEADOW', [[380, 260], [600, 260], [600, 440], [380, 440], [380, 262]], false)
   writeFileSync('public/samples/existing-conditions.dxf', w.toString(2))
 }
 
@@ -150,12 +154,15 @@ mkdirSync('public/samples', { recursive: true })
   addContours(w, zPr, 'PR')
   common(w, 'PR')
   w.polyline('PR-BLDG', rect(PAD.x0 + 10, PAD.y0 + 10, PAD.x1 - 10, PAD.y1 - 10), true)
-  w.polyline('PR-PAVEMENT', rect(LOT.x0, LOT.y0, LOT.x1, LOT.y1), true)
+  const lot = rect(LOT.x0, LOT.y0, LOT.x1, LOT.y1)
+  w.polyline('PR-PAVEMENT', [lot[0], lot[1], lot[2]], false) // edge of pavement in two pieces
+  w.polyline('PR-PAVEMENT', [lot[2], lot[3], lot[0]], false)
   w.polyline('PR-PAVEMENT', rect(300, 34, 330, 150), true) // entrance drive
   w.polyline('PR-LAWN', rect(PAD.x0 - 30, PAD.y0 - 10, LOT.x1 + 40, PAD.y1 + 40), true)
   w.polyline('PR-LAWN', ellipse(BASIN.cx, BASIN.cy, BASIN.rx * 1.45, BASIN.ry * 1.45), true)
   const basin = ellipse(BASIN.cx, BASIN.cy, BASIN.rx, BASIN.ry)
-  w.polyline('PR-DETENTION-BASIN', basin, true)
+  w.polyline('PR-DETENTION-BASIN', [...basin.slice(0, 21)], false) // drawn as two open arcs
+  w.polyline('PR-DETENTION-BASIN', [...basin.slice(20), basin[0]], false)
   // catch basins in the lot, piped to a flared end in the basin
   const cbs = CBS
   for (const p of cbs) w.circle('PR-STORM-STRC', p, 2)

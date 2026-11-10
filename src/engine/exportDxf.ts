@@ -1,4 +1,6 @@
 import { DxfWriter } from './dxfWrite'
+import { polyArea, simplifyRing, traceLabels } from './geometry'
+import { COVERS, COVER_KEYS } from './runoff'
 import type { AnalysisResult } from './types'
 
 /** Subcatchments, Tc lines, labels and design points as CAD linework, in the drawing's own units. */
@@ -58,6 +60,33 @@ export function exportDxf(r: AnalysisResult, units: 'ft' | 'm' = 'ft') {
     w.text(L.dp, [p[0], p[1] - th * 2.2], th * 1.2, d.name)
   }
   for (const B of r.basins) w.polyline(L.basin, B.ring.map(P), true)
+
+  // closed land-cover and soil polygons, rebuilt from whatever linework the drawing had
+  const g = r.grid
+  const speck = 9 * g.cs * g.cs
+  const toLabels = (src: Uint8Array) => { const a = new Int32Array(src.length); for (let i = 0; i < src.length; i++) a[i] = src[i] === 255 ? -1 : src[i]; return a }
+  const covColor: Record<string, number> = { roof: 8, pavement: 9, gravel: 42, grass: 3, meadow: 52, woods: 94, water: 5, wetland: 4 }
+  for (const [k, parts] of traceLabels(toLabels(r.coverGrid), g)) {
+    const key = COVER_KEYS[k]
+    if (!key) continue
+    const layer = `APL-${tag}-COVER-${key.toUpperCase()}`
+    w.layer(layer, covColor[key] ?? 7)
+    for (const part of parts) {
+      if (Math.abs(polyArea(part.outer)) < speck) continue
+      w.polyline(layer, simplifyRing(part.outer, g.cs).map(P), true)
+      for (const h of part.holes) if (Math.abs(polyArea(h)) >= speck) w.polyline(layer, simplifyRing(h, g.cs).map(P), true)
+    }
+    void COVERS
+  }
+  for (const [h, parts] of traceLabels(toLabels(r.hsgGrid), g)) {
+    const layer = `APL-${tag}-SOILS-HSG-${'ABCD'[h]}`
+    w.layer(layer, 40 + h * 20)
+    for (const part of parts) {
+      if (Math.abs(polyArea(part.outer)) < speck) continue
+      w.polyline(layer, simplifyRing(part.outer, g.cs).map(P), true)
+      for (const hole of part.holes) if (Math.abs(polyArea(hole)) >= speck) w.polyline(layer, simplifyRing(hole, g.cs).map(P), true)
+    }
+  }
   return w.toString(units === 'm' ? 6 : 2)
 }
 

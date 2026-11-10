@@ -204,3 +204,116 @@ export class MinHeap {
     return top
   }
 }
+
+/* ------------------------------------------------------------------ */
+/*  Shapes from open linework                                           */
+/* ------------------------------------------------------------------ */
+
+/** Close a polyline whose ends nearly meet (drafting gaps). Returns null if it is genuinely open. */
+export function autoClose(pts: XY[]): Ring | null {
+  if (pts.length < 3) return null
+  let len = 0
+  for (let i = 1; i < pts.length; i++) len += Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1])
+  const a = pts[0], b = pts[pts.length - 1]
+  const gap = Math.hypot(a[0] - b[0], a[1] - b[1])
+  if (gap <= Math.max(3, 0.03 * len) && len > 4 * gap) {
+    const r = pts.slice()
+    if (gap < 1e-6) r.pop()
+    return r.length >= 3 ? r : null
+  }
+  return null
+}
+
+export interface LineRegions {
+  /** region id per cell, -1 = none */
+  comp: Int32Array
+  /** true when the region reaches the edge of the drawing window (i.e. it is "outside" the linework) */
+  exterior: boolean[]
+  /** connected interior blobs (everything not exterior), id per cell, -1 = none */
+  blob: Int32Array
+  nBlobs: number
+}
+
+/**
+ * Builds regions from any mix of open and closed linework on a grid: lines become barriers
+ * (dilated slightly to seal drafting gaps), the cells between them are flood-filled, and the
+ * barrier cells are given back to the nearest region. Regions touching the grid border are exterior.
+ */
+export function regionsFromLinework(lines: XY[][], g: GridSpec, gapFt = 2.5): LineRegions {
+  const { nx, ny, cs } = g
+  const N = nx * ny
+  const bar = new Uint8Array(N)
+  const mark = (x: number, y: number) => {
+    const c = Math.floor((x - g.x0) / cs), r = Math.floor((y - g.y0) / cs)
+    if (c >= 0 && r >= 0 && c < nx && r < ny) bar[r * nx + c] = 1
+  }
+  for (const L of lines)
+    for (let i = 1; i < L.length; i++) {
+      const [x0, y0] = L[i - 1], [x1, y1] = L[i]
+      const n = Math.max(1, Math.ceil((Math.hypot(x1 - x0, y1 - y0) / cs) * 2))
+      for (let k = 0; k <= n; k++) mark(x0 + ((x1 - x0) * k) / n, y0 + ((y1 - y0) * k) / n)
+    }
+  // seal small gaps
+  const rad = Math.max(1, Math.ceil(gapFt / 2 / cs))
+  const thick = new Uint8Array(N)
+  for (let i = 0; i < N; i++) {
+    if (!bar[i]) continue
+    const c0 = i % nx, r0 = (i - c0) / nx
+    for (let dr = -rad; dr <= rad; dr++)
+      for (let dc = -rad; dc <= rad; dc++) {
+        const c = c0 + dc, r = r0 + dr
+        if (c >= 0 && r >= 0 && c < nx && r < ny) thick[r * nx + c] = 1
+      }
+  }
+  const comp = new Int32Array(N).fill(-1)
+  const exterior: boolean[] = []
+  const stack: number[] = []
+  let id = 0
+  for (let s = 0; s < N; s++) {
+    if (thick[s] || comp[s] >= 0) continue
+    let ext = false
+    comp[s] = id
+    stack.push(s)
+    while (stack.length) {
+      const i = stack.pop()!
+      const c = i % nx, r = (i - c) / nx
+      if (c === 0 || r === 0 || c === nx - 1 || r === ny - 1) ext = true
+      const nbrs = [c > 0 ? i - 1 : -1, c < nx - 1 ? i + 1 : -1, r > 0 ? i - nx : -1, r < ny - 1 ? i + nx : -1]
+      for (const n of nbrs) if (n >= 0 && !thick[n] && comp[n] < 0) { comp[n] = id; stack.push(n) }
+    }
+    exterior.push(ext)
+    id++
+  }
+  // give barrier cells back to the nearest region (multi-source BFS)
+  let front: number[] = []
+  for (let i = 0; i < N; i++) if (comp[i] >= 0) front.push(i)
+  for (let step = 0; step <= rad + 2 && front.length; step++) {
+    const next: number[] = []
+    for (const i of front) {
+      const c = i % nx, r = (i - c) / nx
+      const nbrs = [c > 0 ? i - 1 : -1, c < nx - 1 ? i + 1 : -1, r > 0 ? i - nx : -1, r < ny - 1 ? i + nx : -1]
+      for (const n of nbrs) if (n >= 0 && comp[n] < 0) {
+        // prefer interior regions so shapes keep their full extent up to the line
+        comp[n] = comp[i]
+        next.push(n)
+      }
+    }
+    front = next
+  }
+  // interior blobs = connected cells whose region is not exterior
+  const blob = new Int32Array(N).fill(-1)
+  let nb = 0
+  for (let s = 0; s < N; s++) {
+    if (comp[s] < 0 || exterior[comp[s]] || blob[s] >= 0) continue
+    blob[s] = nb
+    stack.push(s)
+    while (stack.length) {
+      const i = stack.pop()!
+      const c = i % nx, r = (i - c) / nx
+      const nbrs = [c > 0 ? i - 1 : -1, c < nx - 1 ? i + 1 : -1, r > 0 ? i - nx : -1, r < ny - 1 ? i + nx : -1]
+      for (const n of nbrs) if (n >= 0 && blob[n] < 0 && comp[n] >= 0 && !exterior[comp[n]]) { blob[n] = nb; stack.push(n) }
+    }
+    nb++
+  }
+  return { comp, exterior, blob, nBlobs: nb }
+}
