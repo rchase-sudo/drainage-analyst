@@ -19,6 +19,8 @@ export interface AnalyzeOptions {
   base?: Pick<AnalysisResult, 'grid' | 'coverGrid' | 'hsgGrid'> & { z?: Float64Array; labels?: Int32Array }
   /** Window to analyze (set internally for the fine second pass). */
   crop?: { x0: number; y0: number; x1: number; y1: number }
+  /** User-drawn analysis bounds from the other condition, when this drawing has none. */
+  studyRings?: Ring[]
   /** Site limit (LOD / property line) from the other condition, when this drawing has none. */
   siteRings?: Ring[]
   /** Existing peaks by DP id → per storm, for outlet design. */
@@ -51,6 +53,8 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
     throw new Error('No elevation data found. Assign your contour, TIN, or spot-elevation layers the "Surface" role.')
 
   const studyShapes = shapesOf(byRole('study'))
+  // bounds drawn on only one of the two plans apply to both
+  if (!studyShapes.rings.length && !studyShapes.open.length && opt.studyRings?.length) studyShapes.rings.push(...opt.studyRings)
   const studyRings = studyShapes.rings
   let bb = extent([...prim.pts, ...sec.pts, ...prim.faces.flat()])
   if (!Number.isFinite(bb.x0) && opt.base) {
@@ -1197,6 +1201,12 @@ function siteEntities(d: Drawing, role: (e: Ent) => Role, lod?: boolean) {
 }
 
 /** Closed site-limit rings of a drawing, for handing to the other condition. */
+/** Closed analysis-bounds rings of a drawing, for handing to the other condition. */
+export function studyRingsOf(d: Drawing): Ring[] {
+  const roleOf = new Map(d.layers.map((l) => [l.name, l.role]))
+  return shapesOf(d.ents.filter((e) => roleOf.get(e.layer) === 'study')).rings
+}
+
 export function siteRingsOf(d: Drawing): Ring[] {
   const roleOf = new Map(d.layers.map((l) => [l.name, l.role]))
   return shapesOf(siteEntities(d, (e) => roleOf.get(e.layer) ?? 'reference', true)).rings

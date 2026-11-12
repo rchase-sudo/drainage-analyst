@@ -42,6 +42,15 @@ Tc is computed for every subcatchment along its longest travel-time path: TR-55 
 100 ft (Manning's n of the surface it crosses), then shallow concentrated flow with a velocity factor for the
 surface underneath (V = Kv·√s: paved 20.3, gravel 16.1, grass/meadow 7.0, woods 5.0), split wherever the surface changes.
 
+## Inputs you control
+
+- **Rainfall:** 24-hour depths for the 2, 10, 25, 50 and 100-year storms, typed in the strip at the top of the page.
+- **Default soil group:** A, B, C or D for all area not inside a drawn soil line (same strip).
+- **Soil lines:** on a layer with `SOIL` or `HSG` in its name, draw a closed polyline and put the group letter
+  (`A`, `B`, `C`, `D`) as text inside it. That area takes that group.
+- **Analysis bounds:** a closed polyline on a layer named `DRAINAGE-BOUNDS` (also `ANALYSIS-BOUNDS`, `STUDY`,
+  `WATERSHED`, `DRAINAGE-AREA`) limits the analysis to exactly that area. Drawn on either plan, it applies to both.
+
 ## One drop
 
 Drop every file for a project anywhere on the page (existing plan, proposed plan, LiDAR / TIN — any mix of DXF and

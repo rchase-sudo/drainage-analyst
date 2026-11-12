@@ -75,6 +75,8 @@ export interface Settings {
   groupInlets?: boolean
   /** road / drive edges act as drainage divides */
   roadDivides?: boolean
+  /** the user has entered their own rainfall depths */
+  rainfallSet?: boolean
   /** HSG for soil map-unit symbols found on the plan (e.g. "238BH": "C") */
   soilMap?: Record<string, 'A' | 'B' | 'C' | 'D'>
 }

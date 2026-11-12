@@ -1,5 +1,5 @@
 /// <reference lib="webworker" />
-import { analyze, siteRingsOf, type AnalysisOutput } from './engine/analyze'
+import { analyze, siteRingsOf, studyRingsOf, type AnalysisOutput } from './engine/analyze'
 import { importFile } from './engine/importer'
 import { sortDrawings } from './engine/intake'
 import type { Condition, Drawing, LayerInfo, Role, Settings } from './engine/types'
@@ -83,7 +83,7 @@ self.onmessage = (ev: MessageEvent<WorkerIn>) => {
       if (m.condition === 'pre') {
         // the limit of disturbance usually lives on the proposed plan; use it for existing too
         const siteRings = !siteRingsOf(d).length && drawings.post ? siteRingsOf(drawings.post) : undefined
-        r = analyze(d, 'pre', m.settings, { onProgress, siteRings })
+        r = analyze(d, 'pre', m.settings, { onProgress, siteRings, studyRings: !studyRingsOf(d).length && drawings.post ? studyRingsOf(drawings.post) : undefined })
         lastPre = r
       } else {
         const base = lastPre

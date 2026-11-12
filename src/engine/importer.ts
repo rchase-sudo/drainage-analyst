@@ -384,7 +384,7 @@ function labelContours(ents: Ent[]) {
 
 const RX = {
   ignore: /TEXT|ANNO|DIM|TITLE|BORDER|NOTE|LABEL|SYMB|HATCH|VPORT|VIEWPORT|DEFPOINTS|LEGEND|NORTH|SCALE|GRID|MATCH|SHEET/,
-  study: /WATERSHED|STUDY|ANALYSIS.?(AREA|LIMIT|BOUND)|DRAIN(AGE)?.?AREA|LIMIT.?OF.?ANALYSIS|SUBCAT/,
+  study: /WATERSHED|STUDY|ANALYSIS.?(AREA|LIMIT|BOUND)|DRAIN(AGE)?.?(AREA|BOUND|LIMIT)|LIMIT.?OF.?ANALYSIS|SUBCAT|^DA BOUND/,
   designpoint: /\bDP\b|DESIGN.?P(T|OINT)|\bPOA\b|POINT.?OF.?ANALYSIS|ANALYSIS.?P(T|OINT)/,
   soils: /SOIL|\bHSG\b/,
   site: /LIMIT.?OF.?(WORK|DISTURB|CLEAR|GRAD|CONST)|\bLOD\b|\bLOW\b|DISTURB|CLEARING.?LIMIT|\bPL\b|PROP.?LINE|PROPERTY.?LINE|\bBNDY\b|BOUNDARY.?LINE|LOT.?LINE|PARCEL.?LINE/,
@@ -495,7 +495,7 @@ function summarizeLayers(d: Drawing, condition: Condition): LayerInfo[] {
 export const ROLE_LABELS: { role: Role; label: string }[] = [
   { role: 'surface', label: 'Surface (contours / TIN)' },
   { role: 'surface-ex', label: 'Existing surface (fill-in)' },
-  { role: 'study', label: 'Study area limit' },
+  { role: 'study', label: 'Analysis bounds' },
   { role: 'site', label: 'Site limit (LOD / property line)' },
   { role: 'designpoint', label: 'Design point' },
   { role: 'storm', label: 'Storm drainage (CB, pipe, culvert)' },

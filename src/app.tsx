@@ -82,7 +82,7 @@ export function App() {
         const preBusy = live.current.st.pre.status === 'loading' || live.current.st.pre.status === 'running'
         if (c === 'post' && preBusy) return // the pre result triggers post
         // the proposed plan may carry the limit of disturbance the existing run should use: re-run existing first
-        if (c === 'post' && live.current.st.pre.files.length && m.layers.some((l) => l.role === 'site')) { run('pre'); return }
+        if (c === 'post' && live.current.st.pre.files.length && m.layers.some((l) => l.role === 'site' || l.role === 'study')) { run('pre'); return }
         run(c)
       } else if (m.type === 'progress') {
         if (m.id === latest.current[c]) patch(c, { msg: m.msg })
@@ -232,6 +232,24 @@ export function App() {
           <div class="small">Existing plan, proposed plan, LiDAR or TIN — any mix of DXF and LandXML, all at once. Files are sorted, both conditions are analyzed, and the comparison opens on its own.</div>
         </div>
       )}
+      <div class="inputs no-print">
+        <div class="grp">
+          <span class="lbl">24-hr rainfall (in)</span>
+          {settings.storms.map((sm, i) => (
+            <label class="rf"><span>{sm.label}</span>
+              <input type="number" step="0.01" min="0" value={sm.P} onChange={(e) => { const v = parseFloat((e.target as HTMLInputElement).value); if (!(v > 0)) return; const a = [...settings.storms]; a[i] = { ...sm, P: v }; applySettings({ ...settings, storms: a, rainfallSet: true }) }} />
+            </label>
+          ))}
+          {!settings.rainfallSet && <span class="ph">placeholder depths — enter your site's</span>}
+        </div>
+        <div class="grp">
+          <span class="lbl">Default soil group</span>
+          <select value={settings.defaultHSG} onChange={(e) => applySettings({ ...settings, defaultHSG: (e.target as HTMLSelectElement).value as Settings['defaultHSG'] })}>
+            {['A', 'B', 'C', 'D'].map((h) => <option value={h}>HSG {h}</option>)}
+          </select>
+          <span class="hint">everything outside a drawn soil line</span>
+        </div>
+      </div>
       {sortNote.length > 0 && (st.pre.files.length > 0 || st.post.files.length > 0) && (
         <div class="sortnote no-print"><b>Sorted automatically</b> · {sortNote.join(' · ')} · <span>drop a file on a step to override</span></div>
       )}
@@ -501,7 +519,7 @@ function SettingsDrawer({ s, units, onChange, onClose }: { s: Settings; units: {
           </select>
         </div>
         <div style="display:flex;gap:8px;margin-top:22px">
-          <button class="btn primary" onClick={() => { onChange(d); onClose() }}>Apply &amp; re-run</button>
+          <button class="btn primary" onClick={() => { onChange({ ...d, rainfallSet: d.rainfallSet || JSON.stringify(d.storms) !== JSON.stringify(s.storms) }); onClose() }}>Apply &amp; re-run</button>
           <button class="btn ghost" onClick={() => setD(DEFAULT_SETTINGS)}>Defaults</button>
           <button class="btn ghost" onClick={onClose}>Cancel</button>
         </div>
