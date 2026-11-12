@@ -84,7 +84,8 @@ export function SubDetail({ r, s }: { r: AnalysisResult; s: Subcatchment }) {
     <div class="detail">
       <div class="mock">
         <div class="mock__eyebrow">{s.name} · Time of concentration (TR-55)</div>
-        <p class="mock__desc">Longest travel-time path, traced from the surface, to {s.toName}</p>
+        <p class="mock__desc">{s.source === 'ai' ? (s.segments.length ? `Flow path drawn by Claude, to ${s.toName}` : `Roof: minimum Tc, to ${s.toName}`) : `Longest travel-time path, traced from the surface, to ${s.toName}`}</p>
+        {s.note && <div class="note" style="margin-bottom:8px">{s.note}</div>}
         <div class="mock__divider" />
         <div class="mock__lines">
           <div class="mock__line hd"><span>Segment</span><span>L · slope · V → time</span></div>

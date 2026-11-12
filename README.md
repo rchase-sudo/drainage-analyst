@@ -51,6 +51,18 @@ surface underneath (V = Kv·√s: paved 20.3, gravel 16.1, grass/meadow 7.0, woo
 - **Analysis bounds:** a closed polyline on a layer named `DRAINAGE-BOUNDS` (also `ANALYSIS-BOUNDS`, `STUDY`,
   `WATERSHED`, `DRAINAGE-AREA`) limits the analysis to exactly that area. Drawn on either plan, it applies to both.
 
+## Claude delineation (optional)
+
+With an Anthropic API key (Storms & settings → Claude delineation), **Delineate with Claude** sends Claude a
+rendered plan with a coordinate grid, the plan as data (bounds, buildings, structures, pipes, plan text, an elevation
+grid) and, if one was dropped, the plan-sheet PDF. Claude returns subcatchment polygons, where each one drains and its
+flow path: every roof on its own and followed to its receiving structure, each inlet's tributary area, overland
+discharges. The engine then computes area, CN, Tc (TR-55 along Claude's flow path) and hydrographs from those
+polygons — Claude draws, the engine calculates. "Run Claude automatically" does this for both conditions on every drop.
+
+The key is stored in the browser and sent only to the configured endpoint. For customers, point the endpoint at a
+server-side proxy that holds the key (`src/ai.ts`).
+
 ## One drop
 
 Drop every file for a project anywhere on the page (existing plan, proposed plan, LiDAR / TIN — any mix of DXF and

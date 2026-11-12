@@ -119,6 +119,9 @@ export interface CoverRow { cover: CoverKey; hsg: string; areaAc: number; cn: nu
 export interface StormResult { P: number; Q: number; peak: number; tpeak: number; volAcFt: number }
 
 export interface Subcatchment {
+  /** drawn by Claude rather than derived from the surface */
+  source?: 'ai'
+  note?: string
   id: string
   name: string
   kind: 'dp' | 'inlet' | 'basin'
@@ -194,8 +197,38 @@ export interface AnalysisResult {
   labels: Int32Array // subcatchment index per cell (-1 none)
   coverGrid: Uint8Array // cover index per cell (255 = none)
   hsgGrid: Uint8Array // 0..3, 255 = none
+  aiNotes?: string[]
+  aiContext?: AiContext
   /** soil map-unit symbols found without an HSG */
   soilUnits?: { unit: string; hsg: string; areaAc: number }[]
   warnings: string[]
   timings: Record<string, number>
+}
+
+/* ---------- Claude delineation ---------- */
+export interface AiSub {
+  name: string
+  kind: 'roof' | 'surface'
+  ring: XY[]
+  /** where this area's runoff goes: the receiving structure or discharge point */
+  outlet?: XY | null
+  outletName?: string
+  /** longest flow path, most remote point first */
+  path?: XY[]
+  note?: string
+}
+export interface AiModel { subs: AiSub[]; notes: string[] }
+
+/** Everything Claude is given about a condition, in drawing coordinates (ft). */
+export interface AiContext {
+  bbox: { x0: number; y0: number; x1: number; y1: number }
+  bounds: XY[]
+  structures: { kind: string; label: string; x: number; y: number; to?: string }[]
+  pipes: XY[][]
+  buildings: XY[][]
+  basins: { name: string; ring: XY[] }[]
+  dps: { name: string; x: number; y: number }[]
+  texts: { t: string; x: number; y: number; layer: string }[]
+  elev: { x0: number; y0: number; step: number; nx: number; ny: number; z: (number | null)[] }
+  engineSubs: { name: string; to: string; areaAc: number; x: number; y: number }[]
 }

@@ -2,12 +2,12 @@
 import { analyze, siteRingsOf, studyRingsOf, type AnalysisOutput } from './engine/analyze'
 import { importFile } from './engine/importer'
 import { sortDrawings } from './engine/intake'
-import type { Condition, Drawing, LayerInfo, Role, Settings } from './engine/types'
+import type { AiModel, Condition, Drawing, LayerInfo, Role, Settings } from './engine/types'
 
 export type WorkerIn =
   | { type: 'intake'; id: number; files: { name: string; text: string }[] }
   | { type: 'load'; id: number; condition: Condition; files: { name: string; text: string }[] }
-  | { type: 'run'; id: number; condition: Condition; roles: Record<string, Role>; settings: Settings }
+  | { type: 'run'; id: number; condition: Condition; roles: Record<string, Role>; settings: Settings; /** Claude's delineation: set to use it, null to drop it, omit to keep the current one */ model?: AiModel | null }
   | { type: 'clear'; id: number; condition: Condition }
 
 export type WorkerOut =
@@ -20,6 +20,7 @@ export type WorkerOut =
 
 const drawings: Partial<Record<Condition, Drawing>> = {}
 let lastPre: AnalysisOutput | null = null
+const aiModels: Partial<Record<Condition, AiModel | null>> = {}
 
 function merge(ds: Drawing[]): Drawing {
   if (ds.length === 1) return ds[0]
@@ -51,6 +52,8 @@ self.onmessage = (ev: MessageEvent<WorkerIn>) => {
       lastPre = null
       delete drawings.pre
       delete drawings.post
+      delete aiModels.pre
+      delete aiModels.post
       post({ type: 'sorted', id: m.id, condition: 'pre', notes: sorted.notes, has: { pre: !!sorted.pre.length, post: !!sorted.post.length } })
       for (const c of ['pre', 'post'] as Condition[]) {
         const list = sorted[c]
@@ -63,6 +66,7 @@ self.onmessage = (ev: MessageEvent<WorkerIn>) => {
     }
     if (m.type === 'clear') {
       delete drawings[m.condition]
+      delete aiModels[m.condition]
       if (m.condition === 'pre') lastPre = null
       post({ type: 'cleared', id: m.id, condition: m.condition })
       return
@@ -71,6 +75,7 @@ self.onmessage = (ev: MessageEvent<WorkerIn>) => {
       const ds = m.files.map((f) => importFile(f.name, f.text, m.condition))
       const d = merge(ds)
       drawings[m.condition] = d
+      delete aiModels[m.condition]
       post({ type: 'loaded', id: m.id, condition: m.condition, layers: d.layers, files: m.files.map((f) => f.name), units: d.units, hasTin: !!d.tin })
       return
     }
@@ -78,17 +83,20 @@ self.onmessage = (ev: MessageEvent<WorkerIn>) => {
       const d = drawings[m.condition]
       if (!d) throw new Error('Drop a drawing first.')
       d.layers = d.layers.map((l) => ({ ...l, role: m.roles[l.name] ?? l.role }))
+      if (m.model !== undefined) aiModels[m.condition] = m.model
+      const model = aiModels[m.condition] ?? null
       const onProgress = (msg: string) => post({ type: 'progress', id: m.id, condition: m.condition, msg })
       let r: AnalysisOutput
       if (m.condition === 'pre') {
         // the limit of disturbance usually lives on the proposed plan; use it for existing too
         const siteRings = !siteRingsOf(d).length && drawings.post ? siteRingsOf(drawings.post) : undefined
-        r = analyze(d, 'pre', m.settings, { onProgress, siteRings, studyRings: !studyRingsOf(d).length && drawings.post ? studyRingsOf(drawings.post) : undefined })
+        r = analyze(d, 'pre', m.settings, { onProgress, model, siteRings, studyRings: !studyRingsOf(d).length && drawings.post ? studyRingsOf(drawings.post) : undefined })
         lastPre = r
       } else {
         const base = lastPre
         r = analyze(d, 'post', m.settings, {
           onProgress,
+          model,
           forcedDPs: base?.dps.map((p) => ({ id: p.id, name: p.name, x: p.x, y: p.y })),
           base: base ? { grid: base.grid, coverGrid: base.coverGrid, hsgGrid: base.hsgGrid, z: base.z, labels: base.labels } : undefined,
           prePeaks: base ? Object.fromEntries(base.dps.map((p) => [p.id, p.storms.map((s) => s.peak)])) : undefined,

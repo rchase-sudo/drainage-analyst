@@ -4,6 +4,8 @@ import { ROLE_LABELS } from './engine/importer'
 import { COVERS, COVER_KEYS } from './engine/runoff'
 import { DEFAULT_SETTINGS, type AnalysisResult, type Condition, type LayerInfo, type Role, type Settings } from './engine/types'
 import type { WorkerIn, WorkerOut } from './worker'
+import { aiReady, delineate, loadAi, saveAi, type AiConfig } from './ai'
+import type { AiModel } from './engine/types'
 import { CompareView } from './ui/Compare'
 import { MapView } from './ui/MapView'
 import { BasinCards, DPTable, Kpis, SubDetail, SubTable } from './ui/Results'
@@ -57,11 +59,45 @@ export function App() {
   const autoCompare = useRef(false)
   const [dragAll, setDragAll] = useState(false)
 
-  const run = (c: Condition) => {
+  // Claude delineation
+  const [ai, setAi] = useState<AiConfig>(loadAi)
+  const aiRef = useRef(ai)
+  aiRef.current = ai
+  const [aiSt, setAiSt] = useState<Record<Condition, { busy: boolean; error: string }>>({ pre: { busy: false, error: '' }, post: { busy: false, error: '' } })
+  const aiTried = useRef<Record<Condition, boolean>>({ pre: false, post: false })
+  const pdfRef = useRef<{ name: string; b64: string } | null>(null)
+  const [pdfName, setPdfName] = useState('')
+
+  const run = (c: Condition, model?: AiModel | null) => {
     const cur = live.current.st[c]
     if (!cur.layers.length && !cur.files.length) return
     patch(c, { status: 'running', msg: 'Starting', error: '' })
-    latest.current[c] = send({ type: 'run', condition: c, roles: cur.roles, settings: live.current.settings })
+    latest.current[c] = send({ type: 'run', condition: c, roles: cur.roles, settings: live.current.settings, model })
+  }
+
+  /** Send the plan to Claude, then re-run the engine on the subcatchments it draws. */
+  const runAi = async (c: Condition, result: AnalysisResult | null) => {
+    if (!result) return false
+    if (!aiReady(aiRef.current)) { setDrawer(true); return false }
+    aiTried.current[c] = true
+    setAiSt((s) => ({ ...s, [c]: { busy: true, error: '' } }))
+    try {
+      const model = await delineate(aiRef.current, c, result, pdfRef.current)
+      setAiSt((s) => ({ ...s, [c]: { busy: false, error: '' } }))
+      run(c, model)
+      return true
+    } catch (e: any) {
+      setAiSt((s) => ({ ...s, [c]: { busy: false, error: e?.message ?? String(e) } }))
+      return false
+    }
+  }
+  const attachPdf = async (f: File) => {
+    if (f.size > 24e6) { setPdfName(`${f.name} is over 24 MB — not attached`); pdfRef.current = null; return }
+    const buf = new Uint8Array(await f.arrayBuffer())
+    let bin = ''
+    for (let i = 0; i < buf.length; i += 0x8000) bin += String.fromCharCode(...buf.subarray(i, i + 0x8000))
+    pdfRef.current = { name: f.name, b64: btoa(bin) }
+    setPdfName(f.name)
   }
 
   useEffect(() => {
@@ -76,6 +112,7 @@ export function App() {
         return
       }
       if (m.type === 'loaded') {
+        aiTried.current[c] = false
         const roles = Object.fromEntries(m.layers.map((l) => [l.name, l.role]))
         patch(c, { layers: m.layers, roles, files: m.files, units: m.units, status: 'running', msg: 'Reading layers' })
         live.current.st = { ...live.current.st, [c]: { ...live.current.st[c], layers: m.layers, roles, files: m.files } }
@@ -90,12 +127,18 @@ export function App() {
         patch(c, { status: 'error', error: m.message, msg: '' })
       } else if (m.type === 'result') {
         if (m.id !== latest.current[c]) return
-        patch(c, { status: 'done', result: m.result as AnalysisResult, msg: '' })
-        if (c === 'post' && autoCompare.current && live.current.st.pre.status === 'done') { autoCompare.current = false; setTab('compare') }
-        if (c === 'pre') {
-          live.current.st = { ...live.current.st, pre: { ...live.current.st.pre, status: 'done' } }
-          if (live.current.st.post.files.length) run('post')
+        const res = m.result as AnalysisResult
+        patch(c, { status: 'done', result: res, msg: '' })
+        const next = () => {
+          if (c === 'post' && autoCompare.current && live.current.st.pre.status === 'done') { autoCompare.current = false; setTab('compare') }
+          if (c === 'pre') {
+            live.current.st = { ...live.current.st, pre: { ...live.current.st.pre, status: 'done' } }
+            if (live.current.st.post.files.length) run('post')
+          }
         }
+        // automatic mode: Claude draws this condition before the chain moves on
+        if (aiRef.current.auto && aiReady(aiRef.current) && !res.aiNotes && !aiTried.current[c]) runAi(c, res).then((ok) => { if (!ok) next() })
+        else next()
       }
     }
   }, [worker])
@@ -123,7 +166,10 @@ export function App() {
   // Drop everything at once: files are sorted into existing / proposed and the whole pre → post → compare
   // chain runs with no further input.
   const intake = async (list: File[]) => {
+    const pdf = list.find((f) => /\.pdf$/i.test(f.name))
+    if (pdf) await attachPdf(pdf)
     const ok = list.filter((f) => /\.(dxf|xml)$/i.test(f.name))
+    if (pdf && !ok.length) return
     if (!ok.length) { patch('pre', { status: 'error', error: list.some((f) => /\.dwg$/i.test(f.name)) ? 'DWG is not supported; save as DXF from CAD.' : 'Drop .dxf (ASCII) or LandXML .xml files.' }); return }
     patch('pre', { ...blank(), status: 'loading', msg: 'Reading and sorting files' })
     patch('post', { ...blank(), status: 'loading', msg: 'Waiting' })
@@ -220,7 +266,7 @@ export function App() {
         <div class="actions no-print">
           <button class="btn ghost" onClick={loadSample}>Load sample site</button>
           <button class="btn primary" onClick={() => allInput.current?.click()}>Drop project files</button>
-          <input ref={allInput} type="file" accept=".dxf,.xml" multiple hidden onChange={(e) => { const t = e.target as HTMLInputElement; intake([...(t.files ?? [])]); t.value = '' }} />
+          <input ref={allInput} type="file" accept=".dxf,.xml,.pdf" multiple hidden onChange={(e) => { const t = e.target as HTMLInputElement; intake([...(t.files ?? [])]); t.value = '' }} />
           <button class="btn" onClick={() => setDrawer(true)}>Storms &amp; settings</button>
         </div>
       </header>
@@ -286,6 +332,9 @@ export function App() {
           onDxf={() => st[tab].result && download(`${base(tab)}-subcatchments.dxf`, exportDxf(st[tab].result!, st[tab].units as 'ft' | 'm'))}
           onCsv={() => st[tab].result && download(`${base(tab)}-drainage.csv`, exportCsv(st[tab].result!), 'text/csv')}
           onPrint={printReport}
+          ai={{ ...aiSt[tab], ready: aiReady(ai), pdf: pdfName }}
+          onAi={() => runAi(tab, st[tab].result)}
+          onAiOff={() => { aiTried.current[tab] = true; run(tab, null) }}
           snapshotRef={snap}
           snapshot={snapshot}
           preReady={!!st.pre.result}
@@ -303,7 +352,7 @@ export function App() {
           <div class="panel results"><div class="note">Analyze both the existing and the proposed condition to compare them.</div></div>
         ))}
 
-      {drawer && <SettingsDrawer s={settings} units={[...(st.pre.result?.soilUnits ?? []), ...(st.post.result?.soilUnits ?? [])]} onChange={applySettings} onClose={() => setDrawer(false)} />}
+      {drawer && <SettingsDrawer ai={ai} onAi={(c) => { setAi(c); saveAi(c) }} s={settings} units={[...(st.pre.result?.soilUnits ?? []), ...(st.post.result?.soilUnits ?? [])]} onChange={applySettings} onClose={() => setDrawer(false)} />}
 
       <div class="foot">
         <span>Preliminary analysis — TR-55 Tc (sheet + shallow concentrated by surface), CN from drawn cover and soils, SCS runoff, NRCS dimensionless unit hydrograph, level-pool basin routing. Verify before design submittal.</span>
@@ -325,6 +374,9 @@ function CondPanel(p: {
   onDxf: () => void
   onCsv: () => void
   onPrint: () => void
+  ai: { busy: boolean; error: string; ready: boolean; pdf: string }
+  onAi: () => void
+  onAiOff: () => void
   snapshotRef: { current: (() => string) | null }
   snapshot: string
   preReady: boolean
@@ -396,6 +448,14 @@ function CondPanel(p: {
           </div>
         )}
 
+        {(p.ai.busy || p.ai.error || p.ai.pdf) && (
+          <div class="panel">
+            <div class="eyebrow"><span>Claude</span></div>
+            {p.ai.busy && <div class="progress"><span class="spinner" />Claude is reading the plan and drawing subcatchments…</div>}
+            {p.ai.error && <div class="err">{p.ai.error}</div>}
+            {p.ai.pdf && <div class="note">Plan sheet for Claude: {p.ai.pdf}</div>}
+          </div>
+        )}
         {r && r.warnings.length > 0 && (
           <div class="panel">
             <div class="eyebrow"><span>Notes</span></div>
@@ -423,6 +483,9 @@ function CondPanel(p: {
                 <button class="btn primary" onClick={p.onDxf}>Export DXF</button>
                 <button class="btn" onClick={p.onCsv}>CSV</button>
                 <button class="btn" onClick={p.onPrint}>Print report</button>
+                {r.aiNotes
+                  ? <button class="btn" onClick={p.onAiOff}>Back to surface-derived</button>
+                  : <button class="btn ai" onClick={p.onAi} disabled={p.ai.busy}>{p.ai.busy ? 'Claude is drawing…' : 'Delineate with Claude'}</button>}
               </div>
             </div>
             <div class="eyebrow"><span>Design points</span><span>{r.settings.distribution === 'III' ? 'Type III' : 'Type II'} 24-hr</span></div>
@@ -432,6 +495,25 @@ function CondPanel(p: {
             {selSub && <SubDetail r={r} s={selSub} />}
             {!selSub && r.subs[0] && <SubDetail r={r} s={r.subs[0]} />}
             <BasinCards r={r} />
+            {r.aiNotes && (
+              <div class="mock" style="margin-top:16px">
+                <div class="mock__flag ok">Subcatchments drawn by Claude</div>
+                <div class="mock__body">Areas, CN, Tc and flows above are computed by the engine from the polygons and flow paths Claude drew. Review the routing and assumptions before relying on them.</div>
+                <div class="mock__divider" />
+                <div class="mock__lines">
+                  {r.subs.filter((x) => x.source === 'ai').map((x) => (
+                    <div class="mock__line"><span>{x.name} → {x.toName}</span><span style="text-align:right;white-space:normal">{x.note ?? ''}</span></div>
+                  ))}
+                </div>
+                {r.aiNotes.length > 0 && (
+                  <>
+                    <div class="mock__divider" />
+                    <div class="mock__eyebrow" style="margin-bottom:6px">Assumptions</div>
+                    {r.aiNotes.map((n) => <div class="note">• {n}</div>)}
+                  </>
+                )}
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -439,7 +521,7 @@ function CondPanel(p: {
   )
 }
 
-function SettingsDrawer({ s, units, onChange, onClose }: { s: Settings; units: { unit: string; areaAc: number }[]; onChange: (s: Settings) => void; onClose: () => void }) {
+function SettingsDrawer({ s, units, onChange, onClose, ai, onAi }: { ai: AiConfig; onAi: (c: AiConfig) => void; s: Settings; units: { unit: string; areaAc: number }[]; onChange: (s: Settings) => void; onClose: () => void }) {
   const [d, setD] = useState<Settings>(s)
   const set = <K extends keyof Settings>(k: K, v: Settings[K]) => setD({ ...d, [k]: v })
   const num = (v: string, fb: number) => (Number.isFinite(parseFloat(v)) ? parseFloat(v) : fb)
@@ -448,6 +530,16 @@ function SettingsDrawer({ s, units, onChange, onClose }: { s: Settings; units: {
       <div class="drawer-bg" onClick={onClose} />
       <div class="drawer" role="dialog" aria-label="Settings">
         <h2>Storms &amp; settings</h2>
+        <div class="eyebrow" style="margin-top:14px"><span>Claude delineation</span></div>
+        <div class="note" style="margin-bottom:6px">Claude draws the subcatchments from the plan (roofs on their own, each inlet's area, routing); the engine computes the numbers. The key stays in this browser and is sent only to the address below.</div>
+        <div class="field"><span>Anthropic API key</span><input type="password" autocomplete="off" placeholder="sk-ant-…" value={ai.apiKey} onInput={(e) => onAi({ ...ai, apiKey: (e.target as HTMLInputElement).value.trim() })} /></div>
+        <div class="field"><span>Model</span><input value={ai.model} onInput={(e) => onAi({ ...ai, model: (e.target as HTMLInputElement).value.trim() })} /></div>
+        <div class="field"><span>Endpoint</span><input value={ai.endpoint} onInput={(e) => onAi({ ...ai, endpoint: (e.target as HTMLInputElement).value.trim() })} /></div>
+        <div class="field"><span>Run Claude automatically</span>
+          <select value={ai.auto ? 'yes' : 'no'} onChange={(e) => onAi({ ...ai, auto: (e.target as HTMLSelectElement).value === 'yes' })}>
+            <option value="no">No — button only</option><option value="yes">Yes — every analysis</option>
+          </select>
+        </div>
         <div class="note" style="margin-bottom:14px">Enter 24-hour rainfall depths for your site (NOAA Atlas 14 or NRCC). Defaults are placeholders.</div>
         <div class="eyebrow"><span>24-hr rainfall (in)</span></div>
         <div class="storms">

@@ -8,7 +8,7 @@ import {
   COVERS, COVER_KEYS, DT, NSTEP, Outlet, addInto, routeBasin, stats, subHydrograph, tr55StorageRatio,
 } from './runoff'
 import type {
-  AnalysisResult, BasinResult, Condition, CoverKey, CoverRow, DesignPoint, Drawing, Ent, OutletDesign, Role, Settings, Structure,
+  AiContext, AiModel, AnalysisResult, BasinResult, Condition, CoverKey, CoverRow, DesignPoint, Drawing, Ent, OutletDesign, Role, Settings, Structure,
   Subcatchment, TcSegment, V3,
 } from './types'
 
@@ -19,6 +19,8 @@ export interface AnalyzeOptions {
   base?: Pick<AnalysisResult, 'grid' | 'coverGrid' | 'hsgGrid'> & { z?: Float64Array; labels?: Int32Array }
   /** Window to analyze (set internally for the fine second pass). */
   crop?: { x0: number; y0: number; x1: number; y1: number }
+  /** Subcatchments drawn by Claude: used in place of the surface-derived delineation. */
+  model?: AiModel | null
   /** User-drawn analysis bounds from the other condition, when this drawing has none. */
   studyRings?: Ring[]
   /** Site limit (LOD / property line) from the other condition, when this drawing has none. */
@@ -166,12 +168,14 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
   const coverFills: { k: number; area: number; low?: boolean; apply: (fn: (i: number) => void) => void }[] = []
   let openCoverLayers = 0
   const unusedOpen: string[] = []
+  const roofRings: Ring[] = []
   for (const key of COVER_KEYS) {
     const ents = d.ents.filter((e) => role(e) === `cover:${key}`)
     if (!ents.length) continue
     const k = COVER_KEYS.indexOf(key)
     const sh = shapesOf(ents)
     for (const ring of sh.rings) coverFills.push({ k, area: Math.abs(polyArea(ring)), apply: (fn) => rasterizeRing(ring, grid, fn) })
+    if (key === 'roof') roofRings.push(...sh.rings)
     if (!sh.open.length) continue
     // open linework: enclosed areas become shapes; open-ended areas count only when a label or symbol says so
     openCoverLayers++
@@ -793,6 +797,67 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
     labels[i] = u
   }
 
+  // Claude's delineation replaces the surface-derived one; the engine still computes everything from it.
+  const aiUnit: ({ name: string; node: string; note?: string; path?: XY[]; roof: boolean; ord: number } | undefined)[] = []
+  if (opt.model?.subs.length) {
+    labels.fill(-1)
+    unitKeys.length = 0
+    unitIndex.clear()
+    const nodeFor = (sb: AiModel['subs'][number]): string => {
+      const o = sb.outlet
+      if (!o || !Number.isFinite(o[0]) || !Number.isFinite(o[1])) return nearestDP(...centroid(sb.ring))
+      const b = inBasin(o[0], o[1])
+      if (b >= 0) return `B${b}`
+      let bi = -1, bd = 30
+      inlets.forEach((it, k) => { const dd = Math.hypot(it.x - o[0], it.y - o[1]); if (dd < bd) { bd = dd; bi = k } })
+      if (bi >= 0) return `I${bi}`
+      let di = -1
+      bd = 50
+      dpList.forEach((p, k) => { const dd = Math.hypot(cx(p.cell) - o[0], cy(p.cell) - o[1]); if (dd < bd) { bd = dd; di = k } })
+      if (di >= 0) return `D${di}`
+      // a structure or discharge point the drawing's network doesn't carry: make it a node of its own
+      let cell = cellAt(o[0], o[1])
+      if (cell < 0 || !valid[cell]) cell = snapLow(o[0], o[1], Math.ceil(40 / cs))
+      if (cell < 0) return nearestDP(o[0], o[1])
+      let n = 1
+      while (dpList.some((p) => p.id === `DP${n}`)) n++
+      dpList.push({ id: `DP${n}`, name: (sb.outletName || `DP-${n}`).slice(0, 40), cell, forced: true })
+      return `D${dpList.length - 1}`
+    }
+    const ordered = opt.model.subs.map((sb, ord) => ({ sb, ord })).filter((x) => x.sb.ring?.length >= 3)
+      .sort((a, b) => +(a.sb.kind === 'roof') - +(b.sb.kind === 'roof')) // roofs last so they carve out of the ground around them
+    for (const { sb, ord } of ordered) {
+      const u = unitKeys.length
+      const node = nodeFor(sb)
+      unitKeys.push(`A${u}|${node}`)
+      aiUnit[u] = { name: String(sb.name || `S-${u + 1}`).slice(0, 16), node, note: sb.note, path: sb.path, roof: sb.kind === 'roof', ord }
+      rasterizeRing(sb.ring, grid, (i) => { if (valid[i]) labels[i] = u })
+    }
+    // close slivers between drawn polygons
+    let front: number[] = []
+    for (let i = 0; i < N; i++) if (labels[i] >= 0) front.push(i)
+    for (let st = Math.ceil(12 / cs); st > 0 && front.length; st--) {
+      const nxt: number[] = []
+      for (const i of front) {
+        const c = i % nx
+        for (const j of [c > 0 ? i - 1 : -1, c < nx - 1 ? i + 1 : -1, i - nx, i + nx])
+          if (j >= 0 && j < N && valid[j] && labels[j] < 0) { labels[j] = labels[i]; nxt.push(j) }
+      }
+      front = nxt
+    }
+    // anything Claude left out keeps its surface-derived subcatchment
+    let left = 0
+    for (let i = 0; i < N; i++) {
+      if (!valid[i] || labels[i] >= 0) continue
+      const key = unitKeyOf(i)
+      let u = unitIndex.get(key)
+      if (u == null) { u = unitKeys.length; unitIndex.set(key, u); unitKeys.push(key) }
+      labels[i] = u
+      left++
+    }
+    if (left * cellAc > 0.01) warnings.push(`${(left * cellAc).toFixed(2)} ac was not covered by Claude's subcatchments and kept its surface-derived delineation.`)
+  }
+
 
   /* ---------------- per-unit stats: area, CN, cover table ---------------- */
   say('Computing curve numbers')
@@ -859,6 +924,22 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
   }
   const tcOf: { tc: number; segs: TcSegment[] }[] = []
   for (let u = 0; u < U; u++) {
+    const ai = aiUnit[u]
+    if (ai?.roof) { tcOf.push({ tc: 0, segs: [] }); continue } // roofs: minimum Tc
+    if (ai?.path && ai.path.length >= 2) {
+      // Tc along the flow path Claude drew, by the same TR-55 rules
+      const cells: number[] = []
+      for (let k = 1; k < ai.path.length; k++) {
+        const a = ai.path[k - 1], b = ai.path[k]
+        const n = Math.max(1, Math.ceil((Math.hypot(b[0] - a[0], b[1] - a[1]) / cs) * 2))
+        for (let t = 0; t <= n; t++) {
+          const c = cellAt(a[0] + ((b[0] - a[0]) * t) / n, a[1] + ((b[1] - a[1]) * t) / n)
+          if (c >= 0 && !Number.isNaN(z[c]) && cells[cells.length - 1] !== c) cells.push(c)
+        }
+      }
+      const r = cells.length >= 2 ? detailTc(cells[0], cells) : { tc: 0, segs: [] }
+      if (r.tc > 0) { tcOf.push(r); continue }
+    }
     const arr = cand[u].sort((a, b) => b.t - a.t).slice(0, 12)
     let best: { tc: number; segs: TcSegment[] } = { tc: 0, segs: [] }
     for (const c of arr) {
@@ -867,10 +948,10 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
     }
     tcOf.push(best)
   }
-  function detailTc(start: number): { tc: number; segs: TcSegment[] } {
-    const path = [start]
+  function detailTc(start: number, given?: number[]): { tc: number; segs: TcSegment[] } {
+    const path = given ?? [start]
     let cur = start, guard = 0
-    while (!stopAt(cur) && guard++ < N) { cur = dir[cur]; path.push(cur) }
+    while (!given && !stopAt(cur) && guard++ < N) { cur = dir[cur]; path.push(cur) }
     const segs: TcSegment[] = []
     // cumulative distance
     const cum = [0]
@@ -945,6 +1026,8 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
   unitOrder.forEach((u, k) => subNo.set(u, k + 1))
   for (let u = 0; u < U; u++) {
     const key = unitKeys[u]
+    if (!cnt[u]) continue
+    const ai = aiUnit[u]
     const areaAc = cnt[u] * cellAc
     const covers = unitCovers[u].sort((a, b) => b.areaAc - a.areaAc)
     const cn = covers.reduce((s, c) => s + c.cn * c.areaAc, 0) / Math.max(1e-9, areaAc)
@@ -952,15 +1035,17 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
     const tcRaw = tcOf[u].tc
     const tcMin = Math.max(S.minTcMin, tcRaw)
     const storms = S.storms.map((st) => subHydrograph(areaAc, cn, tcMin / 60, st.P, S.distribution))
-    const kind: Subcatchment['kind'] = key[0] === 'D' ? 'dp' : key[0] === 'I' || key[0] === 'V' ? 'inlet' : 'basin'
-    const to = key[0] === 'V' ? key.slice(1) : key
+    const to = ai ? ai.node : key[0] === 'V' ? key.slice(1) : key
+    const kind: Subcatchment['kind'] = ai ? (to[0] === 'D' ? 'dp' : to[0] === 'I' ? 'inlet' : 'basin') : key[0] === 'D' ? 'dp' : key[0] === 'I' || key[0] === 'V' ? 'inlet' : 'basin'
     const speck = 4 * cs * cs // drop single-cell slivers left by diagonal D8 joins
     const rings = (traced.get(u) ?? [])
       .filter((r) => Math.abs(polyArea(r.outer)) >= speck)
       .map((r) => ({ outer: simplifyRing(r.outer, 1.0 * cs), holes: r.holes.filter((h) => Math.abs(polyArea(h)) >= speck).map((h) => simplifyRing(h, 1.0 * cs)) }))
     subs.push({
       id: `S${u}`,
-      name: `${prefix}${subNo.get(u)}`,
+      source: ai ? 'ai' : undefined,
+      note: ai?.note,
+      name: ai ? ai.name : `${prefix}${subNo.get(u)}`,
       kind,
       to,
       toName: key[0] === 'V' ? `${nodeName(to)} (via inlets)` : nodeName(to),
@@ -977,7 +1062,8 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
       hydro: storms.map((r) => r.q),
     })
   }
-  subs.sort((a, b) => +a.name.slice(1) - +b.name.slice(1))
+  const ordOf = (sb: Subcatchment) => { const a = aiUnit[+sb.id.slice(1)]; return a ? a.ord : 1e6 + (+sb.name.slice(1) || 0) }
+  subs.sort((a, b) => ordOf(a) - ordOf(b))
 
   /* ---------------- node routing ---------------- */
   const nodeIds = new Set<string>([...dpList.map((_, k) => `D${k}`), ...inlets.map((_, k) => `I${k}`), ...basinsIn.map((_, k) => `B${k}`)])
@@ -1181,10 +1267,44 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
   ]
   mark('done')
 
+  function buildContext(): AiContext {
+    const mask = new Int32Array(N)
+    for (let i = 0; i < N; i++) mask[i] = valid[i] ? 0 : -1
+    const outer = (traceLabels(mask, grid).get(0) ?? []).map((r) => r.outer).sort((a, b) => Math.abs(polyArea(b)) - Math.abs(polyArea(a)))[0] ?? []
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity
+    for (const p of outer) { if (p[0] < x0) x0 = p[0]; if (p[1] < y0) y0 = p[1]; if (p[0] > x1) x1 = p[0]; if (p[1] > y1) y1 = p[1] }
+    const pad = 0.06 * Math.max(x1 - x0, y1 - y0, 1)
+    const box = { x0: x0 - pad, y0: y0 - pad, x1: x1 + pad, y1: y1 + pad }
+    const inBox = (x: number, y: number) => x >= box.x0 && x <= box.x1 && y >= box.y0 && y <= box.y1
+    const step = Math.max(cs, Math.max(box.x1 - box.x0, box.y1 - box.y0) / 28)
+    const ex = Math.ceil((box.x1 - box.x0) / step) + 1, ey = Math.ceil((box.y1 - box.y0) / step) + 1
+    const ez: (number | null)[] = []
+    for (let r = 0; r < ey; r++) for (let c = 0; c < ex; c++) {
+      const i = cellAt(box.x0 + c * step, box.y0 + r * step)
+      ez.push(i >= 0 && !Number.isNaN(z[i]) ? Math.round(z[i] * 10) / 10 : null)
+    }
+    const texts = allTexts.filter((t) => inBox(t.pts[0][0], t.pts[0][1]) && (t.text ?? '').trim().length > 0 && (t.text ?? '').length < 80)
+      .slice(0, 700).map((t) => ({ t: (t.text ?? '').trim(), x: t.pts[0][0], y: t.pts[0][1], layer: t.layer }))
+    return {
+      bbox: box,
+      bounds: simplifyRing(outer, 1.5 * cs),
+      structures: structsOut.filter((st) => inBox(st.x, st.y)).map((st) => ({ kind: st.kind, label: st.label, x: st.x, y: st.y, to: st.to })),
+      pipes: pipes.filter((p) => p.some((v) => inBox(v[0], v[1]))),
+      buildings: roofRings.filter((r) => r.some((v) => inBox(v[0], v[1]))).map((r) => simplifyRing(r, 0.5)),
+      basins: basins.map((B) => ({ name: B.name, ring: B.ring })),
+      dps: dps.map((p) => ({ name: p.name, x: p.x, y: p.y })),
+      texts,
+      elev: { x0: box.x0, y0: box.y0, step, nx: ex, ny: ey, z: ez },
+      engineSubs: subs.filter((sb) => sb.source !== 'ai').map((sb) => ({ name: sb.name, to: sb.toName, areaAc: +sb.areaAc.toFixed(3), x: sb.label[0], y: sb.label[1] })),
+    }
+  }
+
   return {
     condition, fileName: d.fileName, settings: S, grid, bbox: bb, zmin, zmax, studyAc, dt: DT,
     subs, dps, basins, structures: structsOut, pipes, reference, contours, shade, labels,
     coverGrid: cover, hsgGrid: hsg, soilUnits, warnings, timings, z,
+    aiNotes: opt.model?.subs.length ? opt.model.notes ?? [] : undefined,
+    aiContext: buildContext(),
   }
 }
 
