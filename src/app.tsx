@@ -53,6 +53,10 @@ export function App() {
     return id
   }
 
+  const [sortNote, setSortNote] = useState<string[]>([])
+  const autoCompare = useRef(false)
+  const [dragAll, setDragAll] = useState(false)
+
   const run = (c: Condition) => {
     const cur = live.current.st[c]
     if (!cur.layers.length && !cur.files.length) return
@@ -64,6 +68,13 @@ export function App() {
     worker.onmessage = (ev: MessageEvent<WorkerOut>) => {
       const m = ev.data
       const c = m.condition
+      if (m.type === 'sorted') {
+        setSortNote(m.notes)
+        setSt((s) => ({ pre: m.has.pre ? s.pre : blank(), post: m.has.post ? s.post : blank() }))
+        live.current.st = { pre: m.has.pre ? { ...live.current.st.pre, status: 'loading' } : blank(), post: m.has.post ? live.current.st.post : blank() }
+        setTab(m.has.pre ? 'pre' : 'post')
+        return
+      }
       if (m.type === 'loaded') {
         const roles = Object.fromEntries(m.layers.map((l) => [l.name, l.role]))
         patch(c, { layers: m.layers, roles, files: m.files, units: m.units, status: 'running', msg: 'Reading layers' })
@@ -80,6 +91,7 @@ export function App() {
       } else if (m.type === 'result') {
         if (m.id !== latest.current[c]) return
         patch(c, { status: 'done', result: m.result as AnalysisResult, msg: '' })
+        if (c === 'post' && autoCompare.current && live.current.st.pre.status === 'done') { autoCompare.current = false; setTab('compare') }
         if (c === 'pre') {
           live.current.st = { ...live.current.st, pre: { ...live.current.st.pre, status: 'done' } }
           if (live.current.st.post.files.length) run('post')
@@ -107,6 +119,32 @@ export function App() {
     send({ type: 'load', condition: c, files })
     setTab(c)
   }
+
+  // Drop everything at once: files are sorted into existing / proposed and the whole pre → post → compare
+  // chain runs with no further input.
+  const intake = async (list: File[]) => {
+    const ok = list.filter((f) => /\.(dxf|xml)$/i.test(f.name))
+    if (!ok.length) { patch('pre', { status: 'error', error: list.some((f) => /\.dwg$/i.test(f.name)) ? 'DWG is not supported; save as DXF from CAD.' : 'Drop .dxf (ASCII) or LandXML .xml files.' }); return }
+    patch('pre', { ...blank(), status: 'loading', msg: 'Reading and sorting files' })
+    patch('post', { ...blank(), status: 'loading', msg: 'Waiting' })
+    live.current.st = { pre: { ...blank(), status: 'loading' }, post: blank() }
+    autoCompare.current = true
+    const files = await Promise.all(ok.map(async (f) => ({ name: f.name, text: await f.text() })))
+    send({ type: 'intake', files })
+  }
+  useEffect(() => {
+    const over = (e: DragEvent) => { if (e.dataTransfer?.types?.includes('Files')) { e.preventDefault(); setDragAll(true) } }
+    const leave = (e: DragEvent) => { if (!e.relatedTarget) setDragAll(false) }
+    const drop = (e: DragEvent) => {
+      setDragAll(false)
+      if (e.defaultPrevented) return // a per-condition drop zone took it
+      e.preventDefault()
+      intake([...(e.dataTransfer?.files ?? [])])
+    }
+    window.addEventListener('dragover', over); window.addEventListener('dragleave', leave); window.addEventListener('drop', drop)
+    return () => { window.removeEventListener('dragover', over); window.removeEventListener('dragleave', leave); window.removeEventListener('drop', drop) }
+  }, [])
+  const allInput = useRef<HTMLInputElement>(null)
 
   const loadSample = async () => {
     const get = async (n: string) => ({ name: n, text: await (await fetch(`./samples/${n}`)).text() })
@@ -181,9 +219,22 @@ export function App() {
         </div>
         <div class="actions no-print">
           <button class="btn ghost" onClick={loadSample}>Load sample site</button>
+          <button class="btn primary" onClick={() => allInput.current?.click()}>Drop project files</button>
+          <input ref={allInput} type="file" accept=".dxf,.xml" multiple hidden onChange={(e) => { const t = e.target as HTMLInputElement; intake([...(t.files ?? [])]); t.value = '' }} />
           <button class="btn" onClick={() => setDrawer(true)}>Storms &amp; settings</button>
         </div>
       </header>
+
+      {dragAll && <div class="dropall">Drop every file for the project — existing, proposed, surface. They are sorted automatically.</div>}
+      {st.pre.status === 'empty' && st.post.status === 'empty' && (
+        <div class="hero no-print" onClick={() => allInput.current?.click()}>
+          <div class="big">Drop the whole project here</div>
+          <div class="small">Existing plan, proposed plan, LiDAR or TIN — any mix of DXF and LandXML, all at once. Files are sorted, both conditions are analyzed, and the comparison opens on its own.</div>
+        </div>
+      )}
+      {sortNote.length > 0 && (st.pre.files.length > 0 || st.post.files.length > 0) && (
+        <div class="sortnote no-print"><b>Sorted automatically</b> · {sortNote.join(' · ')} · <span>drop a file on a step to override</span></div>
+      )}
 
       <nav class="steps no-print">
         {(['pre', 'post'] as Condition[]).map((c, i) => {
@@ -224,7 +275,12 @@ export function App() {
       )}
       {tab === 'compare' &&
         (canCompare ? (
-          <CompareView pre={st.pre.result!} post={st.post.result!} />
+          <>
+            <div class="actions no-print" style="justify-content:flex-end;margin-bottom:12px">
+              <button class="btn primary" onClick={() => download(`${base('post')}-pre-post-subcatchments.dxf`, exportDxf([st.pre.result!, st.post.result!], st.post.units as 'ft' | 'm'))}>Export pre + post DXF</button>
+            </div>
+            <CompareView pre={st.pre.result!} post={st.post.result!} />
+          </>
         ) : (
           <div class="panel results"><div class="note">Analyze both the existing and the proposed condition to compare them.</div></div>
         ))}

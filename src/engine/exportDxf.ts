@@ -4,7 +4,13 @@ import { COVERS, COVER_KEYS } from './runoff'
 import type { AnalysisResult } from './types'
 
 /** Subcatchments, Tc lines, labels and design points as CAD linework, in the drawing's own units. */
-export function exportDxf(r: AnalysisResult, units: 'ft' | 'm' = 'ft') {
+export function exportDxf(rs: AnalysisResult | AnalysisResult[], units: 'ft' | 'm' = 'ft') {
+  const w = new DxfWriter()
+  for (const r of Array.isArray(rs) ? rs : [rs]) writeResult(w, r, units)
+  return w.toString(units === 'm' ? 6 : 2)
+}
+
+function writeResult(w: DxfWriter, r: AnalysisResult, units: 'ft' | 'm') {
   const k = units === 'm' ? 1 / 3.280839895 : 1
   const P = (p: [number, number]): [number, number] => [p[0] * k, p[1] * k]
   const tag = r.condition === 'pre' ? 'EX' : 'PR'
@@ -18,7 +24,6 @@ export function exportDxf(r: AnalysisResult, units: 'ft' | 'm' = 'ft') {
     dp: `APL-${tag}-DESIGN-POINT`,
     basin: `APL-${tag}-BASIN`,
   }
-  const w = new DxfWriter()
   w.layer(L.sub, r.condition === 'pre' ? 3 : 6)
     .layer(L.lbl, 7)
     .layer(L.sheet, 2, 'DASHED')
@@ -87,7 +92,6 @@ export function exportDxf(r: AnalysisResult, units: 'ft' | 'm' = 'ft') {
       for (const hole of part.holes) if (Math.abs(polyArea(hole)) >= speck) w.polyline(layer, simplifyRing(hole, g.cs).map(P), true)
     }
   }
-  return w.toString(units === 'm' ? 6 : 2)
 }
 
 function niceText(h: number) {

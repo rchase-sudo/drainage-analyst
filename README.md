@@ -42,6 +42,19 @@ Tc is computed for every subcatchment along its longest travel-time path: TR-55 
 100 ft (Manning's n of the surface it crosses), then shallow concentrated flow with a velocity factor for the
 surface underneath (V = Kv·√s: paved 20.3, gravel 16.1, grass/meadow 7.0, woods 5.0), split wherever the surface changes.
 
+## One drop
+
+Drop every file for a project anywhere on the page (existing plan, proposed plan, LiDAR / TIN — any mix of DXF and
+LandXML). Files are sorted into existing and proposed by name and by what their layers hold; a single drawing that
+carries both existing and proposed layers is used for both conditions. Existing runs, then proposed, then the
+comparison opens. Dropping a file on a step overrides the sort.
+
+- The proposed condition is always analyzed over exactly the same area as existing, so the two are comparable.
+- Large blocks (bound xrefs, grouped site linework, "Export to AutoCAD" surfaces) are read through to their contents.
+- Unlabeled tree lines: woods is assumed on the side away from buildings and pavement.
+- HydroCAD (`HC_*`) and this app's own `APL-*` layers are treated as outputs and never fed back in.
+- "Export pre + post DXF" on the compare tab writes both conditions to one drawing.
+
 ## Site mode and engineering conventions
 
 When the plan has a limit of disturbance (`LOD`, `LIMIT OF WORK`, `AREA-DISTURBED`) and/or a property line, and no

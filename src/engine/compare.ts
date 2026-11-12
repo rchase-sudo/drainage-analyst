@@ -62,6 +62,16 @@ export function compare(pre: AnalysisResult, post: AnalysisResult) {
     const dImp = r.postImpAc - r.preImpAc
     if (!bad.length) {
       const sized = basins.filter((B) => B.outlet)
+      const over = sized.filter((B) => B.outlet!.results.some((x) => x.overtops))
+      if (over.length) {
+        for (const B of over)
+          out.push({
+            level: 'warn', dp: r.name, title: `${r.name}: ${B.name} overtops as graded`,
+            body: `Peaks at ${r.name} are at or below existing, but ${B.name} holds only ${fmtCf(B.maxStorage)} below its rim (${B.rim.toFixed(2)}, bottom ${B.bottom.toFixed(2)}) and overtops in ${B.outlet!.results.filter((x) => x.overtops).length} of ${B.outlet!.results.length} storms. Check that the basin's contours are inside its outline, or deepen / enlarge it.`,
+            lines: outletLines(B, post),
+          })
+        continue
+      }
       out.push({
         level: 'ok', dp: r.name, title: `${r.name}: proposed peaks at or below existing`,
         body: sized.length

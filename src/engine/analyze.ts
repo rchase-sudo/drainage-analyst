@@ -16,7 +16,7 @@ export interface AnalyzeOptions {
   /** Design points carried over from the other condition so pre/post compare at the same locations. */
   forcedDPs?: { id: string; name: string; x: number; y: number }[]
   /** Existing-condition result, used to fill proposed surface gaps and carry forward undisturbed cover/soils. */
-  base?: Pick<AnalysisResult, 'grid' | 'coverGrid' | 'hsgGrid'> & { z?: Float64Array }
+  base?: Pick<AnalysisResult, 'grid' | 'coverGrid' | 'hsgGrid'> & { z?: Float64Array; labels?: Int32Array }
   /** Window to analyze (set internally for the fine second pass). */
   crop?: { x0: number; y0: number; x1: number; y1: number }
   /** Site limit (LOD / property line) from the other condition, when this drawing has none. */
@@ -58,7 +58,9 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
     bb = { x0: g.x0, y0: g.y0, x1: g.x0 + g.nx * g.cs, y1: g.y0 + g.ny * g.cs }
   } else if (opt.base && condition === 'post') {
     const g = opt.base.grid
-    bb = { x0: Math.min(bb.x0, g.x0), y0: Math.min(bb.y0, g.y0), x1: Math.max(bb.x1, g.x0 + g.nx * g.cs), y1: Math.max(bb.y1, g.y0 + g.ny * g.cs) }
+    // proposed is analyzed over the same window (and below, the same area) as existing
+    if (opt.base.labels) bb = { x0: g.x0 + g.cs, y0: g.y0 + g.cs, x1: g.x0 + (g.nx - 1) * g.cs, y1: g.y0 + (g.ny - 1) * g.cs }
+    else bb = { x0: Math.min(bb.x0, g.x0), y0: Math.min(bb.y0, g.y0), x1: Math.max(bb.x1, g.x0 + g.nx * g.cs), y1: Math.max(bb.y1, g.y0 + g.ny * g.cs) }
   }
   if (studyRings.length || studyShapes.open.length) {
     const sb = extent([...studyRings.flat(), ...studyShapes.open.flat()].map((p) => [p[0], p[1], 0] as V3))
@@ -113,6 +115,19 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
       for (let i = 0; i < N; i++) if (reg.blob[i] >= 0 && !Number.isNaN(z[i])) valid[i] = 1
     }
   } else for (let i = 0; i < N; i++) valid[i] = Number.isNaN(z[i]) ? 0 : 1
+  // Pre and post must cover the same ground to be comparable: lock the proposed analysis to the existing area.
+  let lockedToBase = false
+  if (condition === 'post' && opt.base?.labels && !studyRings.length && !studyShapes.open.length) {
+    const bg = opt.base.grid
+    const keep = new Uint8Array(N)
+    let n = 0
+    for (let i = 0; i < N; i++) {
+      if (!valid[i]) continue
+      const c = Math.floor((cx(i) - bg.x0) / bg.cs), r = Math.floor((cy(i) - bg.y0) / bg.cs)
+      if (c >= 0 && r >= 0 && c < bg.nx && r < bg.ny && opt.base.labels[r * bg.nx + c] >= 0) { keep[i] = 1; n++ }
+    }
+    if (n >= 50) { valid.set(keep); lockedToBase = true }
+  }
   let nValid = 0, zmin = Infinity, zmax = -Infinity
   for (let i = 0; i < N; i++) if (valid[i]) { nValid++; if (z[i] < zmin) zmin = z[i]; if (z[i] > zmax) zmax = z[i] }
   if (nValid < 50) throw new Error('The surface covers too little area to analyze.')
@@ -144,8 +159,9 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
   const defCover = COVER_KEYS.indexOf(defKey)
   const PRIORITY: CoverKey[] = ['woods', 'meadow', 'wetland', 'water', 'grass', 'dirt', 'gravel', 'pavement', 'roof']
   const allTexts = d.ents.filter((e) => e.kind === 'text' && e.text)
-  const coverFills: { k: number; area: number; apply: (fn: (i: number) => void) => void }[] = []
+  const coverFills: { k: number; area: number; low?: boolean; apply: (fn: (i: number) => void) => void }[] = []
   let openCoverLayers = 0
+  const unusedOpen: string[] = []
   for (const key of COVER_KEYS) {
     const ents = d.ents.filter((e) => role(e) === `cover:${key}`)
     if (!ents.length) continue
@@ -155,7 +171,7 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
     if (!sh.open.length) continue
     // open linework: enclosed areas become shapes; open-ended areas count only when a label or symbol says so
     openCoverLayers++
-    const reg = regionsFromLinework([...sh.open, ...sh.rings.map(closeRing)], grid)
+    const reg = regionsFromLinework([...sh.open, ...sh.rings.map(closeRing)], grid, key === 'woods' ? 12 : undefined)
     // An open-ended area (e.g. one side of a tree line) is only used for pervious cover, and only when a label
     // or symbol on a matching layer (E-TREE-TEXT, E-TREE-SYM...) sits inside it and it isn't most of the drawing.
     // Impervious cover always needs an enclosed outline.
@@ -168,6 +184,31 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
     }
     const compSize = new Map<number, number>()
     for (let i = 0; i < N; i++) if (reg.comp[i] >= 0) compSize.set(reg.comp[i], (compSize.get(reg.comp[i]) ?? 0) + 1)
+    // Unlabeled tree lines: the side holding the buildings and pavement is the clearing, the other side is woods.
+    const woodsSide = new Set<number>(), clearedSide = new Set<number>()
+    if (key === 'woods' && !votes.size) {
+      const dev = new Uint8Array(N)
+      for (const f of coverFills) if (COVERS[COVER_KEYS[f.k]].imperv) f.apply((i) => { dev[i] = 1 })
+      const devN = new Map<number, number>(), valN = new Map<number, number>()
+      for (let i = 0; i < N; i++) {
+        const c = reg.comp[i]
+        if (c < 0 || !valid[i]) continue
+        valN.set(c, (valN.get(c) ?? 0) + 1)
+        if (dev[i]) devN.set(c, (devN.get(c) ?? 0) + 1)
+      }
+      for (const [c, n] of valN) {
+        if (n < 0.03 * nValid) continue
+        const share = (devN.get(c) ?? 0) / n
+        if (share >= 0.1) clearedSide.add(c)
+        else if (share < 0.03) woodsSide.add(c)
+      }
+      if (!clearedSide.size || !woodsSide.size) { woodsSide.clear(); clearedSide.clear() }
+      else {
+        warnings.push('Tree lines carry no labels: assumed woods on the side away from buildings and pavement, lawn on the developed side.')
+        const g = COVER_KEYS.indexOf('grass')
+        coverFills.push({ k: g, area: 0, low: true, apply: (fn) => { for (let i = 0; i < N; i++) if (clearedSide.has(reg.comp[i])) fn(i) } })
+      }
+    }
     // width of each region (twice the largest distance to its edge): a road or drive is a narrow strip, a building
     // or parking lot is compact, while an infield ringed by a loop road is wide and large — not pavement.
     const width = regionWidths(reg.comp, grid)
@@ -187,16 +228,17 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
       const w = width.get(c) ?? 0
       let ok: boolean
       if (hardCover) ok = !reg.exterior[c] && (ac <= 1.5 || w <= 45)
-      else ok = !reg.exterior[c] || (votes.has(c) && (compSize.get(c) ?? 0) < 0.5 * nValid)
+      else ok = !clearedSide.has(c) && (!reg.exterior[c] || woodsSide.has(c) || (votes.has(c) && (compSize.get(c) ?? 0) < 0.5 * nValid))
       if (ok) take[i] = 1
     }
     for (let i = 0; i < N; i++) if (take[i]) n++
-    if (!n) { warnings.push(`Open linework on ${[...new Set(ents.map((e) => e.layer))].join(', ')} encloses no area; add a "${key.toUpperCase()}" label on the correct side.`); continue }
+    if (!n) { unusedOpen.push(...new Set(ents.map((e) => e.layer))); continue }
     coverFills.push({ k, area: n * cs * cs, apply: (fn) => { for (let i = 0; i < N; i++) if (take[i]) fn(i) } })
   }
+  if (unusedOpen.length) warnings.push(`Lines on ${unusedOpen.slice(0, 6).join(', ')}${unusedOpen.length > 6 ? '…' : ''} don't bound an area, so they set no land cover there (the default cover applies).`)
   if (openCoverLayers) warnings.push(`Built land-cover shapes from open linework on ${openCoverLayers} cover class${openCoverLayers > 1 ? 'es' : ''}; closed versions are in the DXF export.`)
   // lower priority first, and larger first within a class so islands win
-  coverFills.sort((a, b) => PRIORITY.indexOf(COVER_KEYS[a.k]) - PRIORITY.indexOf(COVER_KEYS[b.k]) || b.area - a.area)
+  coverFills.sort((a, b) => +!!b.low - +!!a.low || PRIORITY.indexOf(COVER_KEYS[a.k]) - PRIORITY.indexOf(COVER_KEYS[b.k]) || b.area - a.area)
   for (const p of coverFills) p.apply((i) => { if (valid[i]) { cover[i] = p.k; src[i] = 1 } })
   for (let i = 0; i < N; i++) if (valid[i] && cover[i] === 255) cover[i] = defCover
 
@@ -473,7 +515,7 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
     // Outside the work area a road bounds the analysis (flow from beyond it is not run-on to the site):
     // make those edges hard, keeping a buffer around the work so roads through the site stay crossable.
     const work = lodMask ?? propMask
-    if (walls && work && !studyRings.length) {
+    if (walls && work && !studyRings.length && !lockedToBase) {
       const bufCells = Math.ceil(60 / cs)
       const near = new Uint8Array(N)
       let front: number[] = []
@@ -511,7 +553,7 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
 
   const workMask = lodMask ?? propMask
   const bnd = propMask ?? lodMask
-  if (!studyRings.length && !studyShapes.open.length && workMask && bnd) {
+  if (!lockedToBase && !studyRings.length && !studyShapes.open.length && workMask && bnd) {
     const o = route.order, dr = route.dir
     // everything downstream of the work area
     const reach = new Uint8Array(N)

@@ -28,8 +28,53 @@ function importDXF(fileName: string, text: string): Drawing {
   const ents: Ent[] = []
   const P = (p: any): V3 => [(p?.x ?? 0) * k, (p?.y ?? 0) * k, (p?.z ?? 0) * k]
 
-  for (const e of dxf?.entities ?? []) {
+  // Large blocks (bound xrefs, "Export to AutoCAD" surfaces, grouped site linework) are read through to
+  // their contents; small symbol blocks stay as a single insert point.
+  const blocks: Record<string, any> = dxf?.blocks ?? {}
+  const blockElev = scanBlockPolylineElevations(text)
+  const queue: any[] = []
+  const expand = (ins: any, depth: number): boolean => {
+    const b = blocks[String(ins.name ?? '')]
+    const list: any[] = b?.entities ?? []
+    if (!b || list.length < 8 || depth > 4) return false
+    const sx = ins.xScale ?? 1, sy = ins.yScale ?? 1
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity
+    for (const c of list) for (const v of [...(c.vertices ?? []), c.position, c.center, c.startPoint]) {
+      if (!v || v.x == null) continue
+      if (v.x < x0) x0 = v.x; if (v.x > x1) x1 = v.x; if (v.y < y0) y0 = v.y; if (v.y > y1) y1 = v.y
+    }
+    if (!(Math.hypot((x1 - x0) * sx, (y1 - y0) * sy) * k > 75)) return false
+    const rot = ((ins.rotation ?? 0) * Math.PI) / 180, cos = Math.cos(rot), sin = Math.sin(rot)
+    const bx = b.position?.x ?? 0, by = b.position?.y ?? 0
+    const ix = ins.position?.x ?? 0, iy = ins.position?.y ?? 0, iz = ins.position?.z ?? 0
+    const T = (v: any) => {
+      if (!v || v.x == null) return v
+      const x = (v.x - bx) * sx, y = (v.y - by) * sy
+      return { ...v, x: ix + x * cos - y * sin, y: iy + x * sin + y * cos, z: (v.z ?? 0) * (ins.zScale ?? 1) + iz, bulge: v.bulge && sx * sy < 0 ? -v.bulge : v.bulge }
+    }
+    const zs = blockElev.get(String(ins.name)) ?? []
+    let pi = 0
+    for (const c of list) {
+      const hz = c.type === 'POLYLINE' ? (zs[pi++] ?? 0) : 0
+      const o: any = { ...c, __depth: depth + 1, layer: !c.layer || c.layer === '0' ? ins.layer : c.layer }
+      if (c.vertices) o.vertices = c.vertices.map(T)
+      for (const f of ['position', 'center', 'startPoint']) if (c[f]) o[f] = T(c[f])
+      if (c.fitPoints) o.fitPoints = c.fitPoints.map(T)
+      if (c.controlPoints) o.controlPoints = c.controlPoints.map(T)
+      if (c.type === 'POLYLINE') o.__z = hz * (ins.zScale ?? 1) + iz
+      if (c.type === 'LWPOLYLINE') o.elevation = (c.elevation ?? 0) * (ins.zScale ?? 1) + iz
+      if (c.radius != null) o.radius = c.radius * Math.abs(sx)
+      if (c.type === 'ARC') { o.startAngle = (c.startAngle ?? 0) + rot; o.endAngle = (c.endAngle ?? Math.PI * 2) + rot; if (sx * sy < 0) continue }
+      if (c.type === 'INSERT') { o.xScale = (c.xScale ?? 1) * sx; o.yScale = (c.yScale ?? 1) * sy; o.rotation = (c.rotation ?? 0) + (ins.rotation ?? 0) }
+      queue.push(o)
+    }
+    return true
+  }
+  for (const e of dxf?.entities ?? []) queue.push(e)
+  for (let qi = 0; qi < queue.length; qi++) {
+    const e = queue[qi]
     const layer = String(e.layer ?? '0')
+    if (e.type === 'INSERT' && expand(e, e.__depth ?? 0)) continue
     switch (e.type) {
       case 'LINE': {
         const pts = (e.vertices ?? []).map(P)
@@ -43,7 +88,7 @@ function importDXF(fileName: string, text: string): Drawing {
         break
       }
       case 'POLYLINE': {
-        const headerZ = (polyElev[polyIdx++] ?? 0) * k
+        const headerZ = (e.__z != null ? e.__z : polyElev[polyIdx++] ?? 0) * k
         if (e.isPolyfaceMesh || e.is3dPolygonMesh) {
           for (const v of e.vertices ?? []) if (v.z) ents.push({ kind: 'point', layer, pts: [P(v)], hasZ: true })
           break
@@ -137,6 +182,31 @@ function densifyBulges(vs: any[], k: number, z: number): V3[] {
         const t = s0 + (ang * j) / n
         out.push([(cx + Math.abs(r) * Math.cos(t)) * k, (cy + Math.abs(r) * Math.sin(t)) * k, z])
       }
+    }
+  }
+  return out
+}
+
+/** Same recovery for POLYLINEs inside block definitions, keyed by block name. */
+function scanBlockPolylineElevations(text: string): Map<string, number[]> {
+  const out = new Map<string, number[]>()
+  const sec = text.search(/\n\s*BLOCKS\s*\r?\n/)
+  if (sec < 0) return out
+  const end = text.indexOf('ENDSEC', sec)
+  const lines = text.slice(sec, end < 0 ? undefined : end).split(/\r?\n/)
+  let cur: number[] | null = null
+  for (let i = 0; i + 1 < lines.length; i += 2) {
+    const code = lines[i].trim(), val = lines[i + 1].trim()
+    if (code !== '0') continue
+    if (val === 'BLOCK') {
+      let name = ''
+      for (let j = i + 2; j + 1 < lines.length; j += 2) { const c = lines[j].trim(); if (c === '0') break; if (c === '2') { name = lines[j + 1].trim(); break } }
+      cur = []
+      out.set(name, cur)
+    } else if (val === 'POLYLINE' && cur) {
+      let z = 0
+      for (let j = i + 2; j + 1 < lines.length; j += 2) { const c = lines[j].trim(); if (c === '0') break; if (c === '30') z = parseFloat(lines[j + 1]) || 0 }
+      cur.push(z)
     }
   }
   return out
@@ -321,8 +391,8 @@ const RX = {
   basin: /DETEN|BASIN(?!.*SYM)|INFILTR|\bBIO\b|\bGSF\b|SOIL.?FILTER|SAND.?FILTER|GRAVEL.?WETLAND|BIORET|RAIN.?GARDEN|\bBMP\b|STORMWATER.?(POND|AREA)|RETENTION|TREATMENT.?(SWALE|AREA)/,
   storm: /STRM|STORM|\bSD\b|\bSTM\b|PIPE|CULV|CATCH|\bCB\b|INLET|DRAIN.?(LINE|STR)|DRAINAGE|\bDMH\b|OUTFALL|HEADWALL|\bFES\b/,
   surface: /CONT|TOPO|SURF|\bTIN\b|\bEG\b|\bFG\b|GRADE|GRADING|ELEV|SPOT|BRKL|BREAK|\bGROUND\b|\bGRND\b|MAJR|MINR/,
-  roof: /BLDG|BUILDING|ROOF|HOUSE|GARAGE|SHED|BARN|DWELL|FOOTPRINT/,
-  pavement: /PAVE|PVMT|ASPH|BITUM|\bBIT\b|CONC|DRIVE|DRWY|PARK|ROAD|STREET|\bST\b|SIDEWALK|\bSW\b|WALK|IMPERV|PATIO|HARDSCAPE|\bPAD\b|DECK/,
+  roof: /BLDG|BUILDING|ROOF|HOUSE|GARAGE|\bSHED\b|BARN|DWELL|FOOTPRINT/,
+  pavement: /PAVE|PVMT|ASPH|BITUM|\bBIT\b|CONC(?!EPT)|DRIVE|DRWY|PARK|ROAD|STREET|\bST\b|SIDEWALK|\bSW\b|WALK|IMPERV|PATIO|HARDSCAPE|\bPAD\b|DECK/,
   gravel: /GRAVEL|GRVL|CRUSH|STONE.?(DRIVE|AREA)/,
   dirt: /TRAIL|DIRT/,
   wetland: /WETL|\bWL\b|MARSH|BOG/,
@@ -347,6 +417,8 @@ function guessRole(L: LayerInfo, condition: Condition): Role {
   const n = L.name.toUpperCase().replace(/[_\-.|$]/g, ' ')
   const isEx = RX.ex.test(n) && !RX.pr.test(n)
   const isPr = RX.pr.test(n) && !RX.ex.test(n)
+  // Drainage-model output layers (HydroCAD subcatchments / Tc lines, or this app's own export) are answers, not inputs
+  if (/^HC( |$)|HYDROCAD|^APL /.test(n)) return 'reference'
   const lines = L.polys ?? L.count - L.points - L.faces // polylines and lines, open or closed
   const polysZ = L.polysZ ?? 0
 
@@ -374,7 +446,7 @@ function guessRole(L: LayerInfo, condition: Condition): Role {
     const cov = (Object.keys(COVER_RX) as CoverKey[]).find((k) => COVER_RX[k].test(n))
     // demolished items never count; existing items drawn on the proposed plan still exist, so they count;
     // proposed items on the existing plan don't exist yet
-    if (cov) return (condition === 'post' && RX.demo.test(n)) || (condition === 'pre' && isPr) ? 'reference' : (`cover:${cov}` as Role)
+    if (cov) return (condition === 'post' && RX.demo.test(n)) || (condition === 'pre' && isPr) || /FUTURE/.test(n) ? 'reference' : (`cover:${cov}` as Role)
   }
   return 'reference'
 }
@@ -389,6 +461,13 @@ export const COVER_RX: Record<CoverKey, RegExp> = {
   woods: RX.woods,
   meadow: RX.meadow,
   grass: RX.grass,
+}
+
+/** Re-derive layer roles for a drawing under the other condition (same parsed entities). */
+export function relayer(d: Drawing, condition: Condition): Drawing {
+  const c: Drawing = { ...d, layers: [] }
+  c.layers = summarizeLayers(c, condition)
+  return c
 }
 
 function summarizeLayers(d: Drawing, condition: Condition): LayerInfo[] {
