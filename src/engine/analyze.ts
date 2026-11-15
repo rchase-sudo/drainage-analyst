@@ -993,9 +993,27 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
     }
     const ordered = opt.model.subs.map((sb, ord) => ({ sb, ord })).filter((x) => x.sb.ring?.length >= 3)
       .sort((a, b) => +(a.sb.kind === 'roof') - +(b.sb.kind === 'roof')) // roofs last so they carve out of the ground around them
+    // one surface subcatchment per receiving inlet or design point: areas Claude split but that reach the
+    // same structure are one catchment (its longest flow path sets Tc)
+    const surfaceUnit = new Map<string, number>()
+    const pathLen = (p?: XY[]) => (p ?? []).reduce((a, v, k, arr) => (k ? a + Math.hypot(v[0] - arr[k - 1][0], v[1] - arr[k - 1][1]) : 0), 0)
     for (const { sb, ord } of ordered) {
+      let node0 = ''
+      if (sb.kind !== 'roof') {
+        node0 = nodeFor(sb)
+        const prev = surfaceUnit.get(node0)
+        if (prev != null) {
+          const A = aiUnit[prev]!
+          if (pathLen(sb.path) > pathLen(A.path)) A.path = sb.path
+          if (sb.note) A.note = A.note ? `${A.note} ${sb.note}` : sb.note
+          A.ord = Math.min(A.ord, ord)
+          rasterizeRing(sb.ring, grid, (i) => { if (valid[i]) labels[i] = prev })
+          continue
+        }
+      }
       const u = unitKeys.length
-      let node = nodeFor(sb)
+      let node = node0 || nodeFor(sb)
+      if (sb.kind !== 'roof') surfaceUnit.set(node, u)
       const name = String(sb.name || `S-${u + 1}`).slice(0, 16)
       let note = sb.note
       if (sb.kind === 'roof' && proposedRoof(sb.ring, sb.building)) {
@@ -1007,6 +1025,11 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
       unitKeys.push(`A${u}|${node}`)
       aiUnit[u] = { name, node, note, path: sb.path, roof: sb.kind === 'roof', ord }
       rasterizeRing(sb.ring, grid, (i) => { if (valid[i]) labels[i] = u })
+    }
+    // renumber surface subcatchments after merging (S-1, S-2 … in Claude's order)
+    {
+      let k = 0
+      aiUnit.map((a, u) => ({ a, u })).filter((x) => x.a && !x.a.roof).sort((x, y) => x.a!.ord - y.a!.ord).forEach((x) => { x.a!.name = `S-${++k}` })
     }
     // close slivers between drawn polygons
     let front: number[] = []
