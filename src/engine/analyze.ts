@@ -1283,7 +1283,7 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
       const i = cellAt(box.x0 + c * step, box.y0 + r * step)
       ez.push(i >= 0 && !Number.isNaN(z[i]) ? Math.round(z[i] * 10) / 10 : null)
     }
-    const texts = allTexts.filter((t) => inBox(t.pts[0][0], t.pts[0][1]) && (t.text ?? '').trim().length > 0 && (t.text ?? '').length < 80)
+    const texts = allTexts.filter((t) => role(t) !== 'ignore' && inBox(t.pts[0][0], t.pts[0][1]) && (t.text ?? '').trim().length > 0 && (t.text ?? '').length < 80)
       .slice(0, 700).map((t) => ({ t: (t.text ?? '').trim(), x: t.pts[0][0], y: t.pts[0][1], layer: t.layer }))
     return {
       bbox: box,

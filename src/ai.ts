@@ -35,7 +35,7 @@ How to delineate:
 - Keep polygons simple: at most about 40 vertices each.
 - Where the plan does not show enough to be sure (no grading, missing pipes), make the most reasonable engineering assumption and record it in that subcatchment's note and in the assumptions list.
 
-Answer only by calling submit_subcatchments.`
+Answer only by calling submit_subcatchments, exactly once, with the complete delineation. Do not reply in text.`
 
 const TOOL = {
   name: 'submit_subcatchments',
@@ -164,7 +164,8 @@ export function buildRequest(cfg: AiConfig, condition: Condition, result: Analys
     max_tokens: 16000,
     system: SYSTEM,
     tools: [TOOL],
-    tool_choice: { type: 'tool', name: TOOL.name },
+    // this model does not accept a forced tool call; the instructions require it instead
+    tool_choice: { type: 'auto' },
     messages: [{ role: 'user', content }],
   }
 }

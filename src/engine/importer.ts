@@ -418,7 +418,8 @@ function guessRole(L: LayerInfo, condition: Condition): Role {
   const isEx = RX.ex.test(n) && !RX.pr.test(n)
   const isPr = RX.pr.test(n) && !RX.ex.test(n)
   // Drainage-model output layers (HydroCAD subcatchments / Tc lines, or this app's own export) are answers, not inputs
-  if (/^HC( |$)|HYDROCAD|^APL /.test(n)) return 'reference'
+  // (soil groups drawn on those layers are survey data, so they still count)
+  if (/^HCR? |^HC$|HYDROCAD|^APL /.test(n)) return RX.soils.test(n) && L.closed + (L.points ?? 0) > 0 ? 'soils' : 'ignore'
   const lines = L.polys ?? L.count - L.points - L.faces // polylines and lines, open or closed
   const polysZ = L.polysZ ?? 0
 
