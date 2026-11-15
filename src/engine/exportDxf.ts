@@ -64,7 +64,10 @@ function writeResult(w: DxfWriter, r: AnalysisResult, units: 'ft' | 'm') {
     w.circle(L.dp, p, th * 0.9)
     w.text(L.dp, [p[0], p[1] - th * 2.2], th * 1.2, d.name)
   }
-  for (const B of r.basins) w.polyline(L.basin, B.ring.map(P), true)
+  for (const B of r.basins) {
+    if (B.kind === 'trench') { w.layer(`APL-${tag}-TRENCH`, 5); for (const part of B.parts ?? [B.ring]) w.polyline(`APL-${tag}-TRENCH`, part.map(P), true) }
+    else w.polyline(L.basin, B.ring.map(P), true)
+  }
 
   // closed land-cover and soil polygons, rebuilt from whatever linework the drawing had
   const g = r.grid

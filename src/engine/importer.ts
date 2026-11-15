@@ -430,6 +430,9 @@ function guessRole(L: LayerInfo, condition: Condition): Role {
     if (condition === 'pre') return isPr ? 'reference' : 'surface'
     return isEx ? 'surface-ex' : 'surface'
   }
+  // retaining walls hold back surface flow; the wall's own text/hatch layers are not the wall
+  if (lines > 0 && /RET.?WALL|RETAINING|^(E|P|EX|PR|EXIST|PROP) WALL\b/.test(n) && !/TEXT|LBL|LABEL|SHADE|HATCH|SYM|DIM|DETAIL|SECT/.test(n))
+    return (condition === 'pre' && isPr) || (condition === 'post' && RX.demo.test(n)) ? 'reference' : 'wall'
   if (RX.ignore.test(n) && !RX.soils.test(n)) return 'ignore'
   if (RX.study.test(n)) return lines > 0 ? 'study' : 'reference'
   if (lines > 0 && RX.site.test(n) && !/TEXT|LBL|LABEL|NOPLOT|SETBACK|ABUT|TIE|BRG|DIM|SYM/.test(n)) return 'site'
@@ -501,6 +504,7 @@ export const ROLE_LABELS: { role: Role; label: string }[] = [
   { role: 'designpoint', label: 'Design point' },
   { role: 'storm', label: 'Storm drainage (CB, pipe, culvert)' },
   { role: 'basin', label: 'Stormwater basin' },
+  { role: 'wall', label: 'Retaining wall (flow barrier)' },
   { role: 'soils', label: 'Soils (HSG)' },
   { role: 'cover:roof', label: 'Cover · Roof' },
   { role: 'cover:pavement', label: 'Cover · Pavement' },

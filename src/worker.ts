@@ -7,7 +7,8 @@ import type { AiModel, Condition, Drawing, LayerInfo, Role, Settings } from './e
 export type WorkerIn =
   | { type: 'intake'; id: number; files: { name: string; text: string }[] }
   | { type: 'load'; id: number; condition: Condition; files: { name: string; text: string }[] }
-  | { type: 'run'; id: number; condition: Condition; roles: Record<string, Role>; settings: Settings; /** Claude's delineation: set to use it, null to drop it, omit to keep the current one */ model?: AiModel | null }
+  | { type: 'run'; id: number; condition: Condition; roles: Record<string, Role>; settings: Settings; /** Claude's delineation: set to use it, null to drop it, omit to keep the current one */ model?: AiModel | null; /** design points both conditions must carry: set, null to drop, omit to keep */ required?: DP[] | null }
+  | { type: 'resetAi'; id: number; condition: Condition }
   | { type: 'clear'; id: number; condition: Condition }
 
 export type WorkerOut =
@@ -16,11 +17,14 @@ export type WorkerOut =
   | { type: 'progress'; id: number; condition: Condition; msg: string }
   | { type: 'error'; id: number; condition: Condition; message: string }
   | { type: 'cleared'; id: number; condition: Condition }
+  | { type: 'ready'; id: number; condition: Condition }
   | { type: 'sorted'; id: number; condition: Condition; notes: string[]; has: { pre: boolean; post: boolean } }
 
 const drawings: Partial<Record<Condition, Drawing>> = {}
 let lastPre: AnalysisOutput | null = null
 const aiModels: Partial<Record<Condition, AiModel | null>> = {}
+type DP = { id: string; name: string; x: number; y: number }
+let requiredDPs: DP[] = []
 
 function merge(ds: Drawing[]): Drawing {
   if (ds.length === 1) return ds[0]
@@ -54,6 +58,7 @@ self.onmessage = (ev: MessageEvent<WorkerIn>) => {
       delete drawings.post
       delete aiModels.pre
       delete aiModels.post
+      requiredDPs = []
       post({ type: 'sorted', id: m.id, condition: 'pre', notes: sorted.notes, has: { pre: !!sorted.pre.length, post: !!sorted.post.length } })
       for (const c of ['pre', 'post'] as Condition[]) {
         const list = sorted[c]
@@ -62,6 +67,14 @@ self.onmessage = (ev: MessageEvent<WorkerIn>) => {
         drawings[c] = d
         post({ type: 'loaded', id: m.id, condition: c, layers: d.layers, files: list.map((x) => x.fileName), units: d.units, hasTin: !!d.tin })
       }
+      post({ type: 'ready', id: m.id, condition: 'pre' })
+      return
+    }
+    if (m.type === 'resetAi') {
+      delete aiModels.pre
+      delete aiModels.post
+      requiredDPs = []
+      post({ type: 'ready', id: m.id, condition: m.condition })
       return
     }
     if (m.type === 'clear') {
@@ -76,7 +89,9 @@ self.onmessage = (ev: MessageEvent<WorkerIn>) => {
       const d = merge(ds)
       drawings[m.condition] = d
       delete aiModels[m.condition]
+      requiredDPs = []
       post({ type: 'loaded', id: m.id, condition: m.condition, layers: d.layers, files: m.files.map((f) => f.name), units: d.units, hasTin: !!d.tin })
+      post({ type: 'ready', id: m.id, condition: m.condition })
       return
     }
     if (m.type === 'run') {
@@ -85,19 +100,20 @@ self.onmessage = (ev: MessageEvent<WorkerIn>) => {
       d.layers = d.layers.map((l) => ({ ...l, role: m.roles[l.name] ?? l.role }))
       if (m.model !== undefined) aiModels[m.condition] = m.model
       const model = aiModels[m.condition] ?? null
+      if (m.required !== undefined) requiredDPs = m.required ?? []
       const onProgress = (msg: string) => post({ type: 'progress', id: m.id, condition: m.condition, msg })
       let r: AnalysisOutput
       if (m.condition === 'pre') {
         // the limit of disturbance usually lives on the proposed plan; use it for existing too
         const siteRings = !siteRingsOf(d).length && drawings.post ? siteRingsOf(drawings.post) : undefined
-        r = analyze(d, 'pre', m.settings, { onProgress, model, siteRings, studyRings: !studyRingsOf(d).length && drawings.post ? studyRingsOf(drawings.post) : undefined })
+        r = analyze(d, 'pre', m.settings, { onProgress, model, siteRings, forcedDPs: requiredDPs.length ? requiredDPs : undefined, studyRings: !studyRingsOf(d).length && drawings.post ? studyRingsOf(drawings.post) : undefined })
         lastPre = r
       } else {
         const base = lastPre
         r = analyze(d, 'post', m.settings, {
           onProgress,
           model,
-          forcedDPs: base?.dps.map((p) => ({ id: p.id, name: p.name, x: p.x, y: p.y })),
+          forcedDPs: [...(base?.dps.map((p) => ({ id: p.id, name: p.name, x: p.x, y: p.y })) ?? []), ...requiredDPs.filter((q) => !base?.dps.some((p) => p.id === q.id))],
           base: base ? { grid: base.grid, coverGrid: base.coverGrid, hsgGrid: base.hsgGrid, z: base.z, labels: base.labels } : undefined,
           prePeaks: base ? Object.fromEntries(base.dps.map((p) => [p.id, p.storms.map((s) => s.peak)])) : undefined,
           siteRings: !siteRingsOf(d).length && drawings.pre ? siteRingsOf(drawings.pre) : undefined,

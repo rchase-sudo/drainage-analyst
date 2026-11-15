@@ -5,7 +5,7 @@ import type { CoverKey } from './types'
 export const COVERS: Record<CoverKey, { desc: string; cn: [number, number, number, number]; sheetN: number; paved: boolean; imperv: boolean; color: string; kv: number; kvDesc: string }> = {
   roof: { desc: 'Roofs', cn: [98, 98, 98, 98], sheetN: 0.011, paved: true, imperv: true, color: '#8a8f98', kv: 20.3282, kvDesc: 'Paved' },
   pavement: { desc: 'Paved parking, roads, walks', cn: [98, 98, 98, 98], sheetN: 0.011, paved: true, imperv: true, color: '#5f6670', kv: 20.3282, kvDesc: 'Paved' },
-  gravel: { desc: 'Gravel surface', cn: [76, 85, 89, 91], sheetN: 0.05, paved: false, imperv: false, color: '#b9a888', kv: 16.1345, kvDesc: 'Unpaved' },
+  gravel: { desc: 'Gravel surface', cn: [96, 96, 96, 96], sheetN: 0.05, paved: false, imperv: false, color: '#b9a888', kv: 16.1345, kvDesc: 'Unpaved' },
   dirt: { desc: 'Dirt roads (incl. right-of-way)', cn: [72, 82, 87, 89], sheetN: 0.05, paved: false, imperv: false, color: '#a68a64', kv: 16.1345, kvDesc: 'Unpaved' },
   grass: { desc: 'Open space, >75% grass cover, good', cn: [39, 61, 74, 80], sheetN: 0.24, paved: false, imperv: false, color: '#8fd18a', kv: 7.0, kvDesc: 'Short grass' },
   meadow: { desc: 'Meadow, non-grazed', cn: [30, 58, 71, 78], sheetN: 0.24, paved: false, imperv: false, color: '#c7d98a', kv: 7.0, kvDesc: 'Meadow / pasture' },
@@ -127,7 +127,7 @@ export function addInto(dst: Float32Array, src: Float32Array) {
 /* ---------- Basin routing ---------- */
 const G = 32.174
 
-export interface Outlet { invert: number; orificeD: number; weirCrest: number | null; weirL: number; rim: number; spillL: number }
+export interface Outlet { invert: number; orificeD: number; weirCrest: number | null; weirL: number; rim: number; spillL: number; /** cfs lost to infiltration while water is stored */ loss?: number }
 
 export function outflow(o: Outlet, h: number) {
   let Q = 0
@@ -168,7 +168,7 @@ export function routeBasin(inflow: Float32Array, storage: { z: number; S: number
       const I = I0 + ((I1 - I0) * (k + 0.5)) / sub
       const z = zOf(S)
       O = outflow(o, z)
-      S = Math.max(0, S + (I - O) * h)
+      S = Math.max(0, S + (I - O - (S > 0 ? o.loss ?? 0 : 0)) * h)
     }
     out[i] = outflow(o, zOf(S))
     if (S > maxS) { maxS = S; maxZ = zOf(S) }

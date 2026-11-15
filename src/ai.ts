@@ -23,15 +23,17 @@ export const aiReady = (c: AiConfig) => !!c.apiKey || !/api\.anthropic\.com/.tes
 
 const SYSTEM = `You are a senior civil engineer delineating drainage subcatchments for a pre/post stormwater analysis. You are given a site plan image with a coordinate grid, the same plan as structured data, and sometimes the engineer's plan sheet as a PDF. You draw the subcatchments; software then computes area, curve number, time of concentration and hydrographs from exactly what you draw.
 
-Coordinates: feet, x to the right, y up, origin at the lower-left corner of the image. Use the data's coordinates for buildings, structures and the analysis bounds rather than estimating them from the image.
+Coordinates: feet, x to the right, y up, origin at the lower-left corner of the image. Use the data's coordinates for buildings, structures, walls and the analysis bounds rather than estimating them from the image.
 
 How to delineate:
 - Work only inside the analysis bounds. Your polygons must cover all of it, with no gaps and no overlaps. Share vertices along common edges.
-- Every roof is its own subcatchment (kind "roof", named R-1, R-2 ...), using the building outline from the data. Follow where the roof goes: roof drain or downspout leader to the pipe and structure it reaches. If ridge or valley lines are shown, split the roof along them and send each pitch to the side it sheds to. If nothing shows where a roof drains, send it to the nearest inlet downslope and say so in the note.
-- Every inlet that collects surface runoff (catch basin, drop inlet, yard drain, culvert inlet, basin) gets the ground area that actually reaches it (kind "surface", named S-1, S-2 ...). Decide the divides from spot grades, contours, the elevation grid, curbs, crowns, high points, building faces and swales. Runoff does not cross a building or a curb line. Manholes and cleanouts collect no surface water.
-- Area that leaves the site overland gets a subcatchment per discharge direction, with the outlet at the point on the bounds where it leaves.
-- Outlet: the x,y of the receiving structure taken from the data (or the discharge point), and its name as labelled on the plan (for example "CB 221").
-- Flow path: the longest hydraulic path within the subcatchment as a polyline, starting at the most remote point and ending at the outlet, following the direction water runs. Omit it for roofs.
+- Every roof is its own subcatchment (kind "roof", named R-1, R-2 ...), using the building outline from the data, with "building" set to its id. If ridge or valley lines show how the roof pitches, split it and give each pitch its own subcatchment. For each roof give "drip_edges": the eave lines (as polylines along the outline) where that roof surface sheds water. A gable sheds off its two long eaves; a shed roof off its low side; a hip roof off all sides. Runoff from a PROPOSED building's roof goes to an infiltration trench along those drip edges (the software sizes it); set the roof's outlet to where the trench overflow would go: the ground or structure just below the drip edge.
+- Every inlet that collects surface runoff (catch basin, drop inlet, yard drain, culvert inlet, basin) gets the ground area that actually reaches it (kind "surface", named S-1, S-2 ...). A structure labelled "INV IN", "CB" or "RIM" at a pipe end is a structure. A pipe end with no structure — a roof leader, foundation drain or wall underdrain — collects no surface water, so never give it a subcatchment. Manholes and cleanouts collect no surface water.
+- Decide divides from spot grades, contours, the elevation grid, curbs, crowns, high points, building faces and swales. Runoff does not cross a building or a curb line. Do not create a separate subcatchment for an area that simply flows on into a neighbouring area: merge it into the area it flows through.
+- Retaining walls: where the data says a wall's top stands above the uphill ground, the wall is a barrier. Water on the uphill side never crosses it, not over it and not through an underdrain. It is carried along the wall face to the inlet the wall was built to feed, normally the nearest catch basin at or just beyond the wall's end. Route those areas to that inlet, not to a design point beyond the wall, and draw the divide along the wall. Only the strip on the downhill side of the wall drains past it. Where the wall is flush with the ground, ignore it: flow passes over.
+- Design points: area leaving the analysis bounds overland is assigned to a design point. The design points listed in the data must all be used, and "design_point" on every subcatchment names the design point its runoff finally reaches (through any inlets and pipes). The existing and proposed conditions are compared at the same design points, so do not invent new ones unless the instructions below allow it.
+- Outlet: the x,y of the receiving structure taken from the data (or the design point), and its name as labelled on the plan (for example "CB 221").
+- Flow path: the longest hydraulic path within the subcatchment as a polyline, from the most remote point to the outlet, following the direction water runs. Omit it for roofs.
 - Keep polygons simple: at most about 40 vertices each.
 - Where the plan does not show enough to be sure (no grading, missing pipes), make the most reasonable engineering assumption and record it in that subcatchment's note and in the assumptions list.
 
@@ -52,6 +54,9 @@ const TOOL = {
             kind: { type: 'string', enum: ['roof', 'surface'] },
             description: { type: 'string', description: 'What this area is, in a few words' },
             polygon: { type: 'array', description: 'Closed outline as [x, y] pairs in feet', items: { type: 'array', items: { type: 'number' }, minItems: 2, maxItems: 2 }, minItems: 3 },
+            building: { type: 'string', description: 'Roofs: the building id from the data, e.g. B1' },
+            drip_edges: { type: 'array', description: 'Roofs: eave polylines where this roof surface sheds water', items: { type: 'array', items: { type: 'array', items: { type: 'number' }, minItems: 2, maxItems: 2 }, minItems: 2 } },
+            design_point: { type: 'string', description: 'Name of the design point this runoff finally reaches' },
             outlet: {
               type: 'object',
               properties: { x: { type: 'number' }, y: { type: 'number' }, name: { type: 'string' } },
@@ -87,7 +92,9 @@ export function renderPlan(result: AnalysisResult, ctx: AiContext) {
   for (const c of result.contours) { line(c); g.stroke() }
   g.strokeStyle = '#4a4a4a'; g.lineWidth = 0.9
   for (const c of result.reference) { line(c); g.stroke() }
-  for (const b of ctx.buildings) { line(b, true); g.fillStyle = 'rgba(222,170,110,0.55)'; g.fill(); g.strokeStyle = '#8a4b14'; g.lineWidth = 1.6; g.stroke() }
+  for (const b of ctx.buildings) { line(b.ring, true); g.fillStyle = b.proposed ? 'rgba(222,170,110,0.55)' : 'rgba(170,170,170,0.5)'; g.fill(); g.strokeStyle = '#8a4b14'; g.lineWidth = 1.6; g.stroke() }
+  g.strokeStyle = '#b3261e'; g.lineWidth = 4.5
+  for (const w of ctx.walls) { line(w.line); g.stroke() }
   for (const b of ctx.basins) { line(b.ring, true); g.fillStyle = 'rgba(150,90,220,0.25)'; g.fill(); g.strokeStyle = '#6a2fc0'; g.lineWidth = 1.6; g.stroke() }
   g.strokeStyle = '#1565d8'; g.lineWidth = 2.4
   for (const p of ctx.pipes) { line(p); g.stroke() }
@@ -99,6 +106,9 @@ export function renderPlan(result: AnalysisResult, ctx: AiContext) {
   // the drawing's own text (spot grades, structure labels)
   g.fillStyle = '#333'; g.font = '9px sans-serif'; g.textAlign = 'left'
   for (const t of ctx.texts.slice(0, 450)) g.fillText(t.t.slice(0, 28), X(t.x), Y(t.y))
+  g.font = 'bold 13px sans-serif'; g.fillStyle = '#5a2d0c'; g.textAlign = 'center'
+  for (const b of ctx.buildings) { const c = b.ring.reduce((a, p) => [a[0] + p[0] / b.ring.length, a[1] + p[1] / b.ring.length], [0, 0]); g.fillText(b.id, X(c[0]), Y(c[1])) }
+  g.textAlign = 'left'
   ctx.structures.forEach((st, i) => {
     const x = X(st.x), y = Y(st.y)
     g.fillStyle = st.kind === 'inlet' ? '#0a8a3a' : st.kind === 'outfall' ? '#c2410c' : '#111'
@@ -135,7 +145,8 @@ export function planData(condition: Condition, result: AnalysisResult, ctx: AiCo
     analysis_bounds: ctx.bounds.map(L),
     structures: ctx.structures.map((st, i) => ({ id: `N${i + 1}`, type: st.kind, block_or_label: st.label || undefined, discharges_to: st.to || undefined, xy: L([st.x, st.y]) })),
     pipes: ctx.pipes.map((p) => p.map(L)),
-    buildings: ctx.buildings.map((b, i) => ({ id: `B${i + 1}`, outline: b.map(L) })),
+    buildings: ctx.buildings.map((b) => ({ id: b.id, status: b.proposed ? 'proposed' : 'existing', outline: b.ring.map(L) })),
+    retaining_walls: ctx.walls.map((w) => ({ line: w.line.map(L), note: w.label || undefined })),
     basins: ctx.basins.map((b) => ({ name: b.name, outline: b.ring.map(L) })),
     design_points: ctx.dps.map((d) => ({ name: d.name, xy: L([d.x, d.y]) })),
     plan_text: ctx.texts.map((t) => ({ text: t.t, xy: L([t.x, t.y]), layer: t.layer })),
@@ -155,13 +166,16 @@ export function buildRequest(cfg: AiConfig, condition: Condition, result: Analys
     type: 'text',
     text:
       `Delineate the ${condition === 'pre' ? 'EXISTING' : 'PROPOSED'} condition.\n\n` +
-      `The image is ${image.w} x ${image.h} px at ${image.pxPerFt.toFixed(3)} px per foot; blue grid lines are labelled in feet. Magenta dashed line = analysis bounds, tan = buildings, blue = storm pipes, green squares = inlets, black squares = manholes, orange = end sections and design points. Structures are tagged N1, N2 ... matching the data. Small grey numbers are ground elevations.` +
+      `The image is ${image.w} x ${image.h} px at ${image.pxPerFt.toFixed(3)} px per foot; blue grid lines are labelled in feet. Magenta dashed line = analysis bounds, tan = proposed buildings (grey = existing), thick dark red = retaining walls, blue = storm pipes, green squares = inlets, black squares = manholes, orange = end sections and design points. Structures are tagged N1, N2 ... matching the data. Small grey numbers are ground elevations.` +
       (pdf ? `\nThe attached PDF is the engineer's plan sheet for the same site: use it to read grades, pipe runs, roof drains and labels. It is not in the same coordinates as the image.` : '') +
+      (condition === 'pre'
+        ? `\n\nDesign points: use exactly the ${ctx.dps.length} listed (${ctx.dps.map((d) => d.name).join(', ')}). They are where the proposed condition discharges, so every one must receive the existing land that drains toward that location, even a small area. Some may sit just outside the property line; that is intended.`
+        : `\n\nDesign points: the listed ones (${ctx.dps.map((d) => d.name).join(', ')}) are the existing condition's discharge points; route all area leaving the site to them. Add a new design point only where the proposed closed drainage system discharges at a location none of them covers, and give it a clear name (e.g. "Pipe outfall at Orchard Blossom Rd"); the software adds it to the existing condition too.`) +
       `\n\nPlan data:\n` + JSON.stringify(planData(condition, result, ctx)),
   })
   return {
     model: cfg.model,
-    max_tokens: 16000,
+    max_tokens: 40000,
     system: SYSTEM,
     tools: [TOOL],
     // this model does not accept a forced tool call; the instructions require it instead
@@ -176,16 +190,24 @@ export async function delineate(cfg: AiConfig, condition: Condition, result: Ana
   const body = buildRequest(cfg, condition, result, ctx, renderPlan(result, ctx), pdf)
   const headers: Record<string, string> = { 'content-type': 'application/json', 'anthropic-version': '2023-06-01' }
   if (cfg.apiKey) { headers['x-api-key'] = cfg.apiKey; headers['anthropic-dangerous-direct-browser-access'] = 'true' }
-  let res: Response
-  try {
-    res = await fetch(cfg.endpoint, { method: 'POST', headers, body: JSON.stringify(body) })
-  } catch (e: any) {
-    throw new Error(`Could not reach Claude (${e?.message ?? 'network error'}).`)
+  let json: any = null
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let res: Response
+    try {
+      res = await fetch(cfg.endpoint, { method: 'POST', headers, body: JSON.stringify(body) })
+    } catch (e: any) {
+      throw new Error(`Could not reach Claude (${e?.message ?? 'network error'}).`)
+    }
+    json = await res.json().catch(() => null)
+    if (!res.ok) throw new Error(`Claude returned ${res.status}: ${json?.error?.message ?? res.statusText}`)
+    const done = (json?.content ?? []).some((b: any) => b.type === 'tool_use' && b.name === TOOL.name && b.input?.subcatchments?.length)
+    if (done || json?.stop_reason !== 'max_tokens') break
+    // ran out of room while working it out: ask once more for a more direct answer
+    const last = body.messages[0].content[body.messages[0].content.length - 1]
+    last.text += '\n\nKeep your reasoning brief and go straight to the submit_subcatchments call.'
   }
-  const json: any = await res.json().catch(() => null)
-  if (!res.ok) throw new Error(`Claude returned ${res.status}: ${json?.error?.message ?? res.statusText}`)
   const call = (json?.content ?? []).find((b: any) => b.type === 'tool_use' && b.name === TOOL.name)
-  if (!call) throw new Error(json?.stop_reason === 'max_tokens' ? 'Claude ran out of output before finishing; try again.' : 'Claude did not return a delineation.')
+  if (!call || !call.input?.subcatchments?.length) throw new Error(json?.stop_reason === 'max_tokens' ? 'Claude ran out of output before finishing the delineation.' : 'Claude did not return a delineation.')
   return toModel(call.input, ctx)
 }
 
@@ -199,7 +221,9 @@ export function toModel(input: any, ctx: AiContext): AiModel {
     if (ring.length < 3) continue
     const o = s.outlet && Number.isFinite(+s.outlet.x) && Number.isFinite(+s.outlet.y) ? ([+s.outlet.x + ctx.bbox.x0, +s.outlet.y + ctx.bbox.y0] as [number, number]) : null
     const path = (Array.isArray(s.flow_path) ? s.flow_path : []).map(W).filter(ok)
+    const drip = (Array.isArray(s.drip_edges) ? s.drip_edges : []).map((e: any) => (Array.isArray(e) ? e.map(W).filter(ok) : [])).filter((e: any[]) => e.length >= 2)
     subs.push({
+      building: s.building ? String(s.building) : undefined, drip: drip.length ? drip : undefined, dp: s.design_point ? String(s.design_point) : undefined,
       name: String(s.name ?? ''), kind: s.kind === 'roof' ? 'roof' : 'surface', ring, outlet: o, outletName: s.outlet?.name ? String(s.outlet.name) : undefined,
       path: path.length >= 2 ? path : undefined, note: [s.description, s.note].filter(Boolean).join(' — ') || undefined,
     })

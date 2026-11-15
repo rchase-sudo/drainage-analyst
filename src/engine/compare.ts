@@ -48,7 +48,7 @@ export function compare(pre: AnalysisResult, post: AnalysisResult) {
     const a = pre.dps.find((d) => d.id === r.id)
     const b = post.dps.find((d) => d.id === r.id)
     if (!a && b) {
-      out.push({ level: 'warn', dp: r.name, title: `${r.name}: new outfall`, body: `Proposed grading sends ${b.tributaryAc.toFixed(2)} ac to a point that receives no flow today. Regrade so this area reaches an existing design point, or confirm the receiving area can accept new concentrated flow.` })
+      out.push({ level: 'warn', dp: r.name, title: `${r.name}: missing from existing`, body: `Proposed grading sends ${b.tributaryAc.toFixed(2)} ac to a point that receives no flow today. Regrade so this area reaches an existing design point, or confirm the receiving area can accept new concentrated flow.` })
       continue
     }
     if (a && !b) {
@@ -57,7 +57,7 @@ export function compare(pre: AnalysisResult, post: AnalysisResult) {
     }
     if (!a || !b) continue
     const bad = r.storms.map((s, k) => ({ s, k })).filter((x) => !x.s.ok)
-    const basins = post.basins.filter((B) => resolveDP(post, B.outflowTo) === r.name && B.inflow.some((x) => x.peak > 0.01))
+    const basins = post.basins.filter((B) => B.kind !== 'trench' && resolveDP(post, B.outflowTo) === r.name && B.inflow.some((x) => x.peak > 0.01))
 
     const dImp = r.postImpAc - r.preImpAc
     if (!bad.length) {
@@ -199,10 +199,11 @@ function tributaryTo(r: AnalysisResult, s: AnalysisResult['subs'][number]) {
 }
 
 function passesBasin(r: AnalysisResult, s: AnalysisResult['subs'][number]) {
-  if (s.kind === 'basin') return true
   let cur = bare(s.toName)
   for (let g = 0; g < 50; g++) {
-    if (r.basins.some((b) => b.name === cur)) return true
+    const B = r.basins.find((b) => b.name === cur)
+    if (B && B.kind !== 'trench') return true
+    if (B) { cur = B.outflowTo; continue }
     const st = r.structures.find((x) => x.kind === 'inlet' && x.label === cur)
     if (st?.to) { cur = st.to; continue }
     return false

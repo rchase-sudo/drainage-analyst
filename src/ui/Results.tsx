@@ -126,10 +126,29 @@ export function SubDetail({ r, s }: { r: AnalysisResult; s: Subcatchment }) {
 }
 
 export function BasinCards({ r }: { r: AnalysisResult }) {
-  const basins = r.basins.filter((B) => B.inflow.some((x) => x.peak > 0.01))
-  if (!basins.length) return null
+  const basins = r.basins.filter((B) => B.kind !== 'trench' && B.inflow.some((x) => x.peak > 0.01))
+  const trenches = r.basins.filter((B) => B.kind === 'trench' && B.trench)
+  if (!basins.length && !trenches.length) return null
   return (
     <div class="detail">
+      {trenches.map((B) => {
+        const t = B.trench!
+        const worst = t.results.findIndex((x) => x.overflows)
+        return (
+          <div class="mock">
+            <div class="mock__eyebrow">{B.name} · Infiltration trench</div>
+            <p class="mock__desc">{Math.round(B.lengthFt ?? 0)} ft along the drip edge × {t.width}' wide × {t.depth}' deep · {(t.voids * 100).toFixed(0)}% voids · {Math.round(t.storageCf).toLocaleString()} cf of storage · overflow to {B.outflowTo}</p>
+            <div class="mock__divider" />
+            <div class={`mock__flag ${worst < 0 ? 'ok' : ''}`}>{worst < 0 ? 'Holds every storm' : `Overflows from the ${r.settings.storms[worst].label}`}</div>
+            <div class="mock__lines">
+              <div class="mock__line hd"><span>Storm</span><span>roof peak → overflow · max depth</span></div>
+              {t.results.map((x, k) => (
+                <div class={`mock__line ${x.overflows ? 'up' : ''}`}><span>{r.settings.storms[k].label}</span><span>{x.peakIn.toFixed(2)} → {x.peakOut.toFixed(2)} cfs · {x.maxDepth.toFixed(2)} ft</span></div>
+              ))}
+            </div>
+          </div>
+        )
+      })}
       {basins.map((B) => (
         <div class="mock">
           <div class="mock__eyebrow">{B.name} · Stage-storage from the proposed surface</div>

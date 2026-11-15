@@ -122,8 +122,8 @@ export function MapView({ result, selected, onSelect, emptyTitle, emptyText, sna
       ctx.globalAlpha = 1
     }
     // basins
-    for (const B of result.basins) {
-      line(B.ring, true)
+    for (const B of result.basins) for (const ring of B.parts ?? [B.ring]) {
+      line(ring, true)
       ctx.fillStyle = C('--violet'); ctx.globalAlpha = 0.14; ctx.fill(); ctx.globalAlpha = 1
       ctx.strokeStyle = C('--violet'); ctx.lineWidth = 1.6; ctx.stroke()
     }

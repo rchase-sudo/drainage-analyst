@@ -64,32 +64,84 @@ export function App() {
   const aiRef = useRef(ai)
   aiRef.current = ai
   const [aiSt, setAiSt] = useState<Record<Condition, { busy: boolean; error: string }>>({ pre: { busy: false, error: '' }, post: { busy: false, error: '' } })
-  const aiTried = useRef<Record<Condition, boolean>>({ pre: false, post: false })
   const pdfRef = useRef<{ name: string; b64: string } | null>(null)
   const [pdfName, setPdfName] = useState('')
 
-  const run = (c: Condition, model?: AiModel | null) => {
-    const cur = live.current.st[c]
-    if (!cur.layers.length && !cur.files.length) return
-    patch(c, { status: 'running', msg: 'Starting', error: '' })
-    latest.current[c] = send({ type: 'run', condition: c, roles: cur.roles, settings: live.current.settings, model })
-  }
+  type DP = { id: string; name: string; x: number; y: number }
+  const pending = useRef(new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>())
+  const call = <T,>(m: DistributiveOmit<WorkerIn, 'id'>) =>
+    new Promise<T>((resolve, reject) => { const id = send(m); pending.current.set(id, { resolve, reject }) })
 
-  /** Send the plan to Claude, then re-run the engine on the subcatchments it draws. */
-  const runAi = async (c: Condition, result: AnalysisResult | null) => {
-    if (!result) return false
-    if (!aiReady(aiRef.current)) { setDrawer(true); return false }
-    aiTried.current[c] = true
+  /** One engine run. model: undefined keeps the condition's current Claude delineation, null drops it. */
+  const runP = (c: Condition, o: { model?: AiModel | null; required?: DP[] | null } = {}) => {
+    const cur = live.current.st[c]
+    patch(c, { status: 'running', msg: 'Starting', error: '' })
+    const p = call<AnalysisResult>({ type: 'run', condition: c, roles: cur.roles, settings: live.current.settings, model: o.model, required: o.required })
+    latest.current[c] = reqId.current
+    return p
+  }
+  const toDP = (r: AnalysisResult) => r.dps.map((d) => ({ id: d.id, name: d.name, x: d.x, y: d.y }))
+  const union = (...lists: DP[][]) => { const out: DP[] = []; for (const l of lists) for (const d of l) if (!out.some((q) => q.id === d.id)) out.push(d); return out }
+  const sameDPs = (a: AnalysisResult, b: AnalysisResult) => a.dps.every((d) => b.dps.some((q) => q.id === d.id)) && b.dps.every((d) => a.dps.some((q) => q.id === d.id))
+
+  const askClaude = async (c: Condition, r: AnalysisResult) => {
     setAiSt((s) => ({ ...s, [c]: { busy: true, error: '' } }))
     try {
-      const model = await delineate(aiRef.current, c, result, pdfRef.current)
+      const m = await delineate(aiRef.current, c, r, pdfRef.current)
       setAiSt((s) => ({ ...s, [c]: { busy: false, error: '' } }))
-      run(c, model)
-      return true
+      return m
     } catch (e: any) {
       setAiSt((s) => ({ ...s, [c]: { busy: false, error: e?.message ?? String(e) } }))
-      return false
+      return null
     }
+  }
+
+  /**
+   * Existing → proposed → compare. Both conditions always end with the same design points: anything the proposed
+   * condition discharges to is added to existing (even a little outside the property) and the reverse.
+   * With Claude: proposed is delineated first so its outfalls are known, then existing is delineated against
+   * the full set, then proposed is recomputed on the final existing.
+   */
+  const busyRun = useRef(0)
+  const pipeline = async (o: { claude: boolean }) => {
+    const ticket = ++busyRun.current
+    const stale = () => ticket !== busyRun.current
+    const has = { pre: live.current.st.pre.layers.length > 0, post: live.current.st.post.layers.length > 0 }
+    if (!has.pre && !has.post) return
+    const useAi = o.claude && aiReady(aiRef.current)
+    if (o.claude && !aiReady(aiRef.current)) setDrawer(true)
+    try {
+      let pre = has.pre ? await runP('pre') : null
+      let post = has.post ? await runP('post') : null
+      if (stale()) return
+      if (useAi && post) {
+        const m = await askClaude('post', post)
+        if (stale()) return
+        if (m) post = await runP('post', { model: m })
+      }
+      if (pre && post) {
+        const required = union(toDP(post), toDP(pre))
+        if (useAi) {
+          pre = await runP('pre', { required })
+          const m = await askClaude('pre', pre)
+          if (stale()) return
+          if (m) pre = await runP('pre', { model: m, required })
+          post = await runP('post')
+        } else if (!sameDPs(pre, post)) {
+          pre = await runP('pre', { required })
+          post = await runP('post')
+        }
+        if (!sameDPs(pre, post)) {
+          pre = await runP('pre', { required: union(toDP(post), toDP(pre)) })
+          post = await runP('post')
+        }
+      } else if (useAi && pre && !post) {
+        const m = await askClaude('pre', pre)
+        if (m) pre = await runP('pre', { model: m })
+      }
+      if (stale()) return
+      if (pre && post && autoCompare.current) { autoCompare.current = false; setTab('compare') }
+    } catch { /* the failing condition shows its own error */ }
   }
   const attachPdf = async (f: File) => {
     if (f.size > 24e6) { setPdfName(`${f.name} is over 24 MB — not attached`); pdfRef.current = null; return }
@@ -104,41 +156,27 @@ export function App() {
     worker.onmessage = (ev: MessageEvent<WorkerOut>) => {
       const m = ev.data
       const c = m.condition
+      const done = (ok: boolean, v: any) => { const p = pending.current.get(m.id); if (p) { pending.current.delete(m.id); ok ? p.resolve(v) : p.reject(new Error(String(v))) } }
       if (m.type === 'sorted') {
         setSortNote(m.notes)
         setSt((s) => ({ pre: m.has.pre ? s.pre : blank(), post: m.has.post ? s.post : blank() }))
-        live.current.st = { pre: m.has.pre ? { ...live.current.st.pre, status: 'loading' } : blank(), post: m.has.post ? live.current.st.post : blank() }
         setTab(m.has.pre ? 'pre' : 'post')
-        return
-      }
-      if (m.type === 'loaded') {
-        aiTried.current[c] = false
+      } else if (m.type === 'loaded') {
         const roles = Object.fromEntries(m.layers.map((l) => [l.name, l.role]))
-        patch(c, { layers: m.layers, roles, files: m.files, units: m.units, status: 'running', msg: 'Reading layers' })
-        live.current.st = { ...live.current.st, [c]: { ...live.current.st[c], layers: m.layers, roles, files: m.files } }
-        const preBusy = live.current.st.pre.status === 'loading' || live.current.st.pre.status === 'running'
-        if (c === 'post' && preBusy) return // the pre result triggers post
-        // the proposed plan may carry the limit of disturbance the existing run should use: re-run existing first
-        if (c === 'post' && live.current.st.pre.files.length && m.layers.some((l) => l.role === 'site' || l.role === 'study')) { run('pre'); return }
-        run(c)
+        patch(c, { layers: m.layers, roles, files: m.files, units: m.units, status: 'running', msg: 'Reading layers', result: null })
+        live.current.st = { ...live.current.st, [c]: { ...live.current.st[c], layers: m.layers, roles, files: m.files, units: m.units } }
+      } else if (m.type === 'ready' || m.type === 'cleared') {
+        done(true, null)
       } else if (m.type === 'progress') {
         if (m.id === latest.current[c]) patch(c, { msg: m.msg })
       } else if (m.type === 'error') {
         patch(c, { status: 'error', error: m.message, msg: '' })
+        done(false, m.message)
       } else if (m.type === 'result') {
-        if (m.id !== latest.current[c]) return
         const res = m.result as AnalysisResult
         patch(c, { status: 'done', result: res, msg: '' })
-        const next = () => {
-          if (c === 'post' && autoCompare.current && live.current.st.pre.status === 'done') { autoCompare.current = false; setTab('compare') }
-          if (c === 'pre') {
-            live.current.st = { ...live.current.st, pre: { ...live.current.st.pre, status: 'done' } }
-            if (live.current.st.post.files.length) run('post')
-          }
-        }
-        // automatic mode: Claude draws this condition before the chain moves on
-        if (aiRef.current.auto && aiReady(aiRef.current) && !res.aiNotes && !aiTried.current[c]) runAi(c, res).then((ok) => { if (!ok) next() })
-        else next()
+        live.current.st = { ...live.current.st, [c]: { ...live.current.st[c], status: 'done', result: res } }
+        done(true, res)
       }
     }
   }, [worker])
@@ -154,13 +192,12 @@ export function App() {
 
   const readFiles = async (c: Condition, list: File[]) => {
     const ok = list.filter((f) => /\.(dxf|xml)$/i.test(f.name))
-    if (!ok.length) { patch(c, { status: 'error', error: 'Drop a .dxf (ASCII) or LandXML .xml file.' }); return }
-    if (/\.dwg$/i.test(list[0]?.name ?? '')) { patch(c, { status: 'error', error: 'DWG is not supported; export DXF from CAD.' }); return }
+    if (!ok.length) { patch(c, { status: 'error', error: list.some((f) => /\.dwg$/i.test(f.name)) ? 'DWG is not supported; export DXF from CAD.' : 'Drop a .dxf (ASCII) or LandXML .xml file.' }); return }
     patch(c, { status: 'loading', msg: 'Reading file', error: '', result: null })
     const files = await Promise.all(ok.map(async (f) => ({ name: f.name, text: await f.text() })))
-    if (c === 'pre') live.current.st = { ...live.current.st, pre: { ...live.current.st.pre, status: 'loading' } }
-    send({ type: 'load', condition: c, files })
     setTab(c)
+    await call({ type: 'load', condition: c, files })
+    pipeline({ claude: aiRef.current.auto })
   }
 
   // Drop everything at once: files are sorted into existing / proposed and the whole pre → post → compare
@@ -173,10 +210,11 @@ export function App() {
     if (!ok.length) { patch('pre', { status: 'error', error: list.some((f) => /\.dwg$/i.test(f.name)) ? 'DWG is not supported; save as DXF from CAD.' : 'Drop .dxf (ASCII) or LandXML .xml files.' }); return }
     patch('pre', { ...blank(), status: 'loading', msg: 'Reading and sorting files' })
     patch('post', { ...blank(), status: 'loading', msg: 'Waiting' })
-    live.current.st = { pre: { ...blank(), status: 'loading' }, post: blank() }
+    live.current.st = { pre: blank(), post: blank() }
     autoCompare.current = true
     const files = await Promise.all(ok.map(async (f) => ({ name: f.name, text: await f.text() })))
-    send({ type: 'intake', files })
+    await call({ type: 'intake', files })
+    pipeline({ claude: aiRef.current.auto })
   }
   useEffect(() => {
     const over = (e: DragEvent) => { if (e.dataTransfer?.types?.includes('Files')) { e.preventDefault(); setDragAll(true) } }
@@ -195,38 +233,38 @@ export function App() {
   const loadSample = async () => {
     const get = async (n: string) => ({ name: n, text: await (await fetch(`./samples/${n}`)).text() })
     patch('pre', { status: 'loading', msg: 'Loading sample', error: '', result: null })
-    patch('post', { status: 'loading', msg: 'Waiting for existing', error: '', result: null })
-    live.current.st = { ...live.current.st, pre: { ...live.current.st.pre, status: 'loading' } }
+    patch('post', { status: 'loading', msg: 'Loading sample', error: '', result: null })
     const [a, b] = await Promise.all([get('existing-conditions.dxf'), get('proposed-conditions.dxf')])
-    send({ type: 'load', condition: 'pre', files: [a] })
-    send({ type: 'load', condition: 'post', files: [b] })
     setTab('pre')
+    autoCompare.current = true
+    await Promise.all([call({ type: 'load', condition: 'pre', files: [a] }), call({ type: 'load', condition: 'post', files: [b] })])
+    pipeline({ claude: aiRef.current.auto })
   }
 
-  const clear = (c: Condition) => {
-    send({ type: 'clear', condition: c })
+  const clear = async (c: Condition) => {
+    await call({ type: 'clear', condition: c })
     setSt((s) => ({ ...s, [c]: blank() }))
-    if (c === 'pre' && live.current.st.post.files.length) setTimeout(() => run('post'), 50)
+    live.current.st = { ...live.current.st, [c]: blank() }
+    pipeline({ claude: false })
   }
 
-  // re-run when roles/settings change (debounced)
-  const timer = useRef<Record<string, number>>({})
-  const schedule = (c: Condition) => {
-    clearTimeout(timer.current[c])
-    timer.current[c] = window.setTimeout(() => run(c), 350)
+  // re-run when roles/settings change (debounced); Claude's drawings are kept
+  const timer = useRef(0)
+  const schedule = () => {
+    clearTimeout(timer.current)
+    timer.current = window.setTimeout(() => pipeline({ claude: false }), 350)
   }
   const setRole = (c: Condition, layer: string, role: Role) => {
     const roles = { ...live.current.st[c].roles, [layer]: role }
     patch(c, { roles })
     live.current.st = { ...live.current.st, [c]: { ...live.current.st[c], roles } }
-    schedule(c)
+    schedule()
   }
   const applySettings = (s: Settings) => {
     setSettings(s)
     live.current.settings = s
     try { localStorage.setItem(LS, JSON.stringify(s)) } catch { /* ignore */ }
-    if (live.current.st.pre.files.length) schedule('pre')
-    else if (live.current.st.post.files.length) schedule('post')
+    schedule()
   }
 
   const download = (name: string, text: string, type = 'application/dxf') => {
@@ -333,8 +371,8 @@ export function App() {
           onCsv={() => st[tab].result && download(`${base(tab)}-drainage.csv`, exportCsv(st[tab].result!), 'text/csv')}
           onPrint={printReport}
           ai={{ ...aiSt[tab], ready: aiReady(ai), pdf: pdfName }}
-          onAi={() => runAi(tab, st[tab].result)}
-          onAiOff={() => { aiTried.current[tab] = true; run(tab, null) }}
+          onAi={() => pipeline({ claude: true })}
+          onAiOff={async () => { await call({ type: 'resetAi', condition: tab as Condition }); pipeline({ claude: false }) }}
           snapshotRef={snap}
           snapshot={snapshot}
           preReady={!!st.pre.result}
@@ -485,7 +523,7 @@ function CondPanel(p: {
                 <button class="btn" onClick={p.onPrint}>Print report</button>
                 {r.aiNotes
                   ? <button class="btn" onClick={p.onAiOff}>Back to surface-derived</button>
-                  : <button class="btn ai" onClick={p.onAi} disabled={p.ai.busy}>{p.ai.busy ? 'Claude is drawing…' : 'Delineate with Claude'}</button>}
+                  : <button class="btn ai" onClick={p.onAi} disabled={p.ai.busy}>{p.ai.busy ? 'Claude is drawing…' : 'Delineate both with Claude'}</button>}
               </div>
             </div>
             <div class="eyebrow"><span>Design points</span><span>{r.settings.distribution === 'III' ? 'Type III' : 'Type II'} 24-hr</span></div>
@@ -603,6 +641,16 @@ function SettingsDrawer({ s, units, onChange, onClose, ai, onAi }: { ai: AiConfi
             </>
           )
         })()}
+        <div class="eyebrow" style="margin-top:22px"><span>Proposed roofs → infiltration trench</span></div>
+        <div class="field"><span>Roofs drain to trenches</span>
+          <select value={d.roofTrench === false ? 'no' : 'yes'} onChange={(e) => set('roofTrench', (e.target as HTMLSelectElement).value === 'yes')}>
+            <option value="yes">Yes</option><option value="no">No</option>
+          </select>
+        </div>
+        <div class="field"><span>Width (ft)</span><input type="number" step="0.5" value={d.trenchWidth ?? 2} onInput={(e) => set('trenchWidth', num((e.target as HTMLInputElement).value, 2))} /></div>
+        <div class="field"><span>Depth (ft)</span><input type="number" step="0.5" value={d.trenchDepth ?? 4} onInput={(e) => set('trenchDepth', num((e.target as HTMLInputElement).value, 4))} /></div>
+        <div class="field"><span>Stone voids</span><input type="number" step="0.05" value={d.trenchVoids ?? 0.4} onInput={(e) => set('trenchVoids', num((e.target as HTMLInputElement).value, 0.4))} /></div>
+        <div class="field"><span>Infiltration (in/hr, 0 = storage only)</span><input type="number" step="0.1" value={d.trenchInfil ?? 0} onInput={(e) => set('trenchInfil', num((e.target as HTMLInputElement).value, 0))} /></div>
         <div class="field"><span>Resolution</span>
           <select value={String(d.targetCells)} onChange={(e) => set('targetCells', +(e.target as HTMLSelectElement).value)}>
             <option value="90000">Fast</option>

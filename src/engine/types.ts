@@ -8,6 +8,7 @@ export type Role =
   | 'surface'
   | 'surface-ex' // existing ground used only where the proposed surface has no data (post)
   | 'study'
+  | 'wall' // retaining wall: a barrier to surface flow
   | 'site' // limit of disturbance or property line: design points go where flow leaves it
   | 'soils'
   | 'storm'
@@ -77,6 +78,12 @@ export interface Settings {
   roadDivides?: boolean
   /** the user has entered their own rainfall depths */
   rainfallSet?: boolean
+  /** proposed roofs drain to an infiltration trench along the drip edge */
+  roofTrench?: boolean
+  trenchWidth?: number // ft
+  trenchDepth?: number // ft
+  trenchVoids?: number // 0..1
+  trenchInfil?: number // in/hr through the trench bottom (0 = storage only)
   /** HSG for soil map-unit symbols found on the plan (e.g. "238BH": "C") */
   soilMap?: Record<string, 'A' | 'B' | 'C' | 'D'>
 }
@@ -101,6 +108,11 @@ export const DEFAULT_SETTINGS: Settings = {
   targetCells: 220000,
   groupInlets: true,
   roadDivides: true,
+  roofTrench: true,
+  trenchWidth: 2,
+  trenchDepth: 4,
+  trenchVoids: 0.4,
+  trenchInfil: 0,
 }
 
 export interface TcSegment {
@@ -163,6 +175,11 @@ export interface BasinResult {
   outflowTo: string
   piped: boolean
   inflow: { peak: number; volAcFt: number }[]
+  /** an infiltration trench along a roof drip edge rather than a drawn basin */
+  kind?: 'trench'
+  lengthFt?: number
+  parts?: Ring[]
+  trench?: { width: number; depth: number; voids: number; storageCf: number; results: { peakIn: number; peakOut: number; maxDepth: number; overflows: boolean }[] }
   outlet?: OutletDesign
 }
 
@@ -216,6 +233,11 @@ export interface AiSub {
   /** longest flow path, most remote point first */
   path?: XY[]
   note?: string
+  /** roof: building id it belongs to, and the eave lines water sheds off */
+  building?: string
+  drip?: XY[][]
+  /** design point this area ultimately reaches */
+  dp?: string
 }
 export interface AiModel { subs: AiSub[]; notes: string[] }
 
@@ -225,7 +247,8 @@ export interface AiContext {
   bounds: XY[]
   structures: { kind: string; label: string; x: number; y: number; to?: string }[]
   pipes: XY[][]
-  buildings: XY[][]
+  buildings: { id: string; ring: XY[]; proposed: boolean }[]
+  walls: { line: XY[]; label: string }[]
   basins: { name: string; ring: XY[] }[]
   dps: { name: string; x: number; y: number }[]
   texts: { t: string; x: number; y: number; layer: string }[]
