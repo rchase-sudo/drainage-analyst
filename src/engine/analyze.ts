@@ -1189,8 +1189,34 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
     if (arr.length > 64) { arr.sort((a, b) => b.t - a.t); arr.length = 24 }
   }
   const tcOf: { tc: number; segs: TcSegment[] }[] = []
+  // A subcatchment that discharges straight to a design point the user moved: its Tc path must end at the
+  // point's new location (cut short if the point now sits on the path, extended to it if it sits beyond)
+  const movedDP = new Set(dpList.filter((p) => opt.edits?.dp?.[p.id]).map((p) => p.cell))
+  let tcTarget = -1
+  const toTarget = (path: number[]) => {
+    if (tcTarget < 0 || !path.length) return path
+    const tx = cx(tcTarget), ty = cy(tcTarget)
+    let bk = -1, bd = Infinity
+    path.forEach((c, k) => { const d = Math.hypot(cx(c) - tx, cy(c) - ty); if (d < bd) { bd = d; bk = k } })
+    if (bd <= 2 * cs) return path.slice(0, Math.max(2, bk + 1))
+    // leave the path where it comes closest to the point and run straight to it
+    const out = path.slice(0, bk + 1)
+    const a = out[out.length - 1]
+    const ax = cx(a), ay = cy(a)
+    const n = Math.max(1, Math.ceil(Math.hypot(tx - ax, ty - ay) / (cs / 2)))
+    for (let t = 1; t <= n; t++) {
+      const c = cellAt(ax + ((tx - ax) * t) / n, ay + ((ty - ay) * t) / n)
+      if (c >= 0 && c !== out[out.length - 1] && !Number.isNaN(z[c])) out.push(c)
+    }
+    return out
+  }
   for (let u = 0; u < U; u++) {
     const ai = aiUnit[u]
+    {
+      const nd = unitNode(u)
+      const dc = nd.startsWith('D') && unitKeys[u][0] !== 'V' ? dpList[+nd.slice(1)]?.cell ?? -1 : -1
+      tcTarget = dc >= 0 && movedDP.has(dc) ? dc : -1
+    }
     if (ai?.roof) { tcOf.push({ tc: 0, segs: [] }); continue } // roofs: minimum Tc
     const ts = opt.edits?.tcStart?.[`S${u}`]
     if (ts) {
@@ -1221,9 +1247,10 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
     tcOf.push(best)
   }
   function detailTc(start: number, given?: number[]): { tc: number; segs: TcSegment[] } {
-    const path = given ?? [start]
+    let path = given ? given.slice() : [start]
     let cur = start, guard = 0
     while (!given && !stopAt(cur) && guard++ < N) { cur = dir[cur]; path.push(cur) }
+    path = toTarget(path)
     const segs: TcSegment[] = []
     // cumulative distance
     const cum = [0]
