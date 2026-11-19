@@ -60,6 +60,25 @@ export interface Drawing {
 
 export interface Storm { label: string; P: number }
 
+export interface BmpSetting {
+  /** infiltration rate, in/hr, over the wetted area (0 or unset = no infiltration) */
+  infil?: number
+  /** stone depth (trenches), ft */
+  depth?: number
+  /** stone void ratio (trenches) */
+  voids?: number
+}
+
+/** Manual edits the user makes on the map; the engine recomputes everything else from them. */
+export interface Edits {
+  /** brush strokes that move area into a subcatchment (target: its id, with its receiving node and name as a fallback) */
+  paint: { sub: string; node: string; name?: string; pts: XY[]; r: number }[]
+  /** Tc start point per subcatchment (key: subcatchment id) */
+  tcStart: Record<string, XY>
+  /** design point locations moved by the user (key: design point id); shared by both conditions */
+  dp: Record<string, XY>
+}
+
 export interface Settings {
   storms: Storm[]
   distribution: 'III' | 'II'
@@ -78,12 +97,11 @@ export interface Settings {
   roadDivides?: boolean
   /** the user has entered their own rainfall depths */
   rainfallSet?: boolean
-  /** proposed roofs drain to an infiltration trench along the drip edge */
-  roofTrench?: boolean
-  trenchWidth?: number // ft
-  trenchDepth?: number // ft
+  /** defaults for drawn infiltration trenches when the drawing gives no depth */
+  trenchDepth?: number // ft of stone
   trenchVoids?: number // 0..1
-  trenchInfil?: number // in/hr through the trench bottom (0 = storage only)
+  /** per-BMP settings, keyed by BMP name (e.g. "Trench 1", "Basin 2") */
+  bmp?: Record<string, BmpSetting>
   /** HSG for soil map-unit symbols found on the plan (e.g. "238BH": "C") */
   soilMap?: Record<string, 'A' | 'B' | 'C' | 'D'>
 }
@@ -108,11 +126,9 @@ export const DEFAULT_SETTINGS: Settings = {
   targetCells: 220000,
   groupInlets: true,
   roadDivides: true,
-  roofTrench: true,
-  trenchWidth: 2,
   trenchDepth: 4,
   trenchVoids: 0.4,
-  trenchInfil: 0,
+  bmp: {},
 }
 
 export interface TcSegment {
@@ -175,11 +191,15 @@ export interface BasinResult {
   outflowTo: string
   piped: boolean
   inflow: { peak: number; volAcFt: number }[]
-  /** an infiltration trench along a roof drip edge rather than a drawn basin */
+  /** a drawn stone infiltration trench (storage in the stone voids) rather than a surface basin */
   kind?: 'trench'
   lengthFt?: number
   parts?: Ring[]
   trench?: { width: number; depth: number; voids: number; storageCf: number; results: { peakIn: number; peakOut: number; maxDepth: number; overflows: boolean }[] }
+  /** infiltration rate used, in/hr (0 = none) */
+  infil?: number
+  /** volume infiltrated per storm, ac-ft */
+  infiltrated?: number[]
   outlet?: OutletDesign
 }
 
@@ -249,7 +269,7 @@ export interface AiContext {
   pipes: XY[][]
   buildings: { id: string; ring: XY[]; proposed: boolean }[]
   walls: { line: XY[]; label: string }[]
-  basins: { name: string; ring: XY[] }[]
+  basins: { name: string; ring: XY[]; kind?: 'trench' | 'basin' }[]
   dps: { name: string; x: number; y: number }[]
   texts: { t: string; x: number; y: number; layer: string }[]
   elev: { x0: number; y0: number; step: number; nx: number; ny: number; z: (number | null)[] }

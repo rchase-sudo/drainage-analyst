@@ -27,7 +27,7 @@ Coordinates: feet, x to the right, y up, origin at the lower-left corner of the 
 
 How to delineate:
 - Work only inside the analysis bounds. Your polygons must cover all of it, with no gaps and no overlaps. Share vertices along common edges.
-- Every roof is its own subcatchment (kind "roof", named R-1, R-2 ...), using the building outline from the data, with "building" set to its id. If ridge or valley lines show how the roof pitches, split it and give each pitch its own subcatchment. For each roof give "drip_edges": the eave lines (as polylines along the outline) where that roof surface sheds water. A gable sheds off its two long eaves; a shed roof off its low side; a hip roof off all sides. Runoff from a PROPOSED building's roof goes to an infiltration trench along those drip edges (the software sizes it); set the roof's outlet to where the trench overflow would go: the ground or structure just below the drip edge.
+- Every roof is its own subcatchment (kind "roof", named R-1, R-2 ...), using the building outline from the data, with "building" set to its id. If ridge or valley lines show how the roof pitches, split it and give each pitch its own subcatchment. Where an infiltration trench is drawn along the eaves (listed among the BMPs in the data as kind "trench"), the roof drains to that trench: set the outlet to the trench. Otherwise the roof drains to the ground or structure just below its eaves: set the outlet there.
 - One surface subcatchment per receiving inlet or design point: if two areas reach the same catch basin (even by different routes, such as along a wall face and across a yard), they are one subcatchment.
 - Every inlet that collects surface runoff (catch basin, drop inlet, yard drain, culvert inlet, basin) gets the ground area that actually reaches it (kind "surface", named S-1, S-2 ...). A structure labelled "INV IN", "CB" or "RIM" at a pipe end is a structure. A pipe end with no structure — a roof leader, foundation drain or wall underdrain — collects no surface water, so never give it a subcatchment. Manholes and cleanouts collect no surface water.
 - Decide divides from spot grades, contours, the elevation grid, curbs, crowns, high points, building faces and swales. Runoff does not cross a building or a curb line. Do not create a separate subcatchment for an area that simply flows on into a neighbouring area: merge it into the area it flows through.
@@ -148,7 +148,7 @@ export function planData(condition: Condition, result: AnalysisResult, ctx: AiCo
     pipes: ctx.pipes.map((p) => p.map(L)),
     buildings: ctx.buildings.map((b) => ({ id: b.id, status: b.proposed ? 'proposed' : 'existing', outline: b.ring.map(L) })),
     retaining_walls: ctx.walls.map((w) => ({ line: w.line.map(L), note: w.label || undefined })),
-    basins: ctx.basins.map((b) => ({ name: b.name, outline: b.ring.map(L) })),
+    bmps: ctx.basins.map((b) => ({ name: b.name, kind: b.kind ?? 'basin', outline: b.ring.map(L) })),
     design_points: ctx.dps.map((d) => ({ name: d.name, xy: L([d.x, d.y]) })),
     plan_text: ctx.texts.map((t) => ({ text: t.t, xy: L([t.x, t.y]), layer: t.layer })),
     elevation_grid: {

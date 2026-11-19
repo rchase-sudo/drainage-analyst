@@ -2,12 +2,12 @@
 import { analyze, siteRingsOf, studyRingsOf, type AnalysisOutput } from './engine/analyze'
 import { importFile } from './engine/importer'
 import { sortDrawings } from './engine/intake'
-import type { AiModel, Condition, Drawing, LayerInfo, Role, Settings } from './engine/types'
+import type { AiModel, Condition, Drawing, Edits, LayerInfo, Role, Settings } from './engine/types'
 
 export type WorkerIn =
   | { type: 'intake'; id: number; files: { name: string; text: string }[] }
   | { type: 'load'; id: number; condition: Condition; files: { name: string; text: string }[] }
-  | { type: 'run'; id: number; condition: Condition; roles: Record<string, Role>; settings: Settings; /** Claude's delineation: set to use it, null to drop it, omit to keep the current one */ model?: AiModel | null; /** design points both conditions must carry: set, null to drop, omit to keep */ required?: DP[] | null }
+  | { type: 'run'; id: number; condition: Condition; roles: Record<string, Role>; settings: Settings; /** Claude's delineation: set to use it, null to drop it, omit to keep the current one */ model?: AiModel | null; /** design points both conditions must carry: set, null to drop, omit to keep */ required?: DP[] | null; /** manual map edits */ edits?: Edits }
   | { type: 'resetAi'; id: number; condition: Condition }
   | { type: 'clear'; id: number; condition: Condition }
 
@@ -106,13 +106,14 @@ self.onmessage = (ev: MessageEvent<WorkerIn>) => {
       if (m.condition === 'pre') {
         // the limit of disturbance usually lives on the proposed plan; use it for existing too
         const siteRings = !siteRingsOf(d).length && drawings.post ? siteRingsOf(drawings.post) : undefined
-        r = analyze(d, 'pre', m.settings, { onProgress, model, siteRings, forcedDPs: requiredDPs.length ? requiredDPs : undefined, studyRings: !studyRingsOf(d).length && drawings.post ? studyRingsOf(drawings.post) : undefined })
+        r = analyze(d, 'pre', m.settings, { onProgress, model, siteRings, edits: m.edits, forcedDPs: requiredDPs.length ? requiredDPs : undefined, studyRings: !studyRingsOf(d).length && drawings.post ? studyRingsOf(drawings.post) : undefined })
         lastPre = r
       } else {
         const base = lastPre
         r = analyze(d, 'post', m.settings, {
           onProgress,
           model,
+          edits: m.edits,
           forcedDPs: [...(base?.dps.map((p) => ({ id: p.id, name: p.name, x: p.x, y: p.y })) ?? []), ...requiredDPs.filter((q) => !base?.dps.some((p) => p.id === q.id))],
           base: base ? { grid: base.grid, coverGrid: base.coverGrid, hsgGrid: base.hsgGrid, z: base.z, labels: base.labels } : undefined,
           prePeaks: base ? Object.fromEntries(base.dps.map((p) => [p.id, p.storms.map((s) => s.peak)])) : undefined,

@@ -232,3 +232,29 @@ table.t tbody tr:hover td { background: var(--surface-2); }
 
 .btn.ai { border-color: var(--violet); color: var(--violet); }
 .btn.ai:hover { background: color-mix(in srgb, var(--violet) 10%, transparent); }
+
+/* map editing */
+.chip.edit { border-color: color-mix(in srgb, var(--amber) 55%, var(--line)); }
+.chip.edit.on::before { color: var(--amber); }
+.editbar { position: absolute; left: 12px; right: 56px; top: 50px; display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; padding: 10px 12px;
+  background: color-mix(in srgb, var(--surface) 94%, transparent); border: 1px solid var(--line); border-radius: 8px; box-shadow: var(--shadow); font-size: 12.5px; }
+.editbar .modes { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.editbar .modes button { border: 0; background: transparent; padding: 6px 10px; font-size: 12px; color: var(--soft); cursor: pointer; }
+.editbar .modes button + button { border-left: 1px solid var(--line); }
+.editbar .modes button.on { background: var(--surface-2); color: var(--text); font-weight: 600; }
+.editbar .brush { display: inline-flex; align-items: center; gap: 6px; font-family: 'IBM Plex Mono', ui-monospace, monospace; font-size: 11px; color: var(--soft); }
+.editbar .brush input { width: 90px; }
+.editbar .hint { flex: 1 1 260px; color: var(--soft); line-height: 1.4; }
+.editbar .hint b { color: var(--text); }
+.editbar .busy { color: var(--amber); }
+.editbar .acts { display: inline-flex; gap: 6px; }
+.editbar .acts button { font-size: 12px; padding: 5px 10px; border-radius: 5px; border: 1px solid var(--line); background: var(--surface); color: var(--text); cursor: pointer; }
+.editbar .acts button:disabled { opacity: 0.45; cursor: default; }
+canvas.editing.area { cursor: none; }
+canvas.editing.tc { cursor: crosshair; }
+canvas.editing.dp { cursor: move; }
+@media (max-width: 700px) { .editbar { right: 12px; top: auto; bottom: 40px; } }
+/* per-BMP inputs */
+.bmpins { display: flex; flex-wrap: wrap; gap: 8px 14px; margin: 10px 0 2px; }
+.bmpin { display: inline-flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--soft); font-family: 'IBM Plex Mono', ui-monospace, monospace; }
+.bmpin input { width: 110px; font-size: 12.5px; padding: 5px 7px; border-radius: 4px; border: 1px solid var(--line); background: var(--surface); color: var(--text); }

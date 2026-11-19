@@ -1,5 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks'
 import type { AnalysisResult } from '../engine/types'
+import type { XY } from '../engine/geometry'
+
+/** A manual change made on the map; the engine recomputes area, CN, Tc and flows from it. */
+export type MapEdit =
+  | { kind: 'paint'; sub: string; node: string; name: string; pts: XY[]; r: number }
+  | { kind: 'tc'; sub: string; at: XY }
+  | { kind: 'dp'; dp: string; at: XY }
+type Mode = 'view' | 'area' | 'tc' | 'dp'
 
 export const PALETTE = ['#29e8a6', '#e24fd0', '#ffa53d', '#4cc9f0', '#b8f35a', '#ff6f91', '#9b8cff', '#f9d65c', '#5ee0d0', '#ff9a6b', '#7fb2ff', '#d6a2ff']
 export const subColor = (i: number) => PALETTE[i % PALETTE.length]
@@ -13,15 +21,24 @@ interface Props {
   emptyTitle: string
   emptyText: string
   snapshotRef?: { current: (() => string) | null }
+  onEdit?: (e: MapEdit) => void
+  onUndo?: () => void
+  onResetEdits?: () => void
+  editCount?: number
+  busy?: boolean
 }
 
-export function MapView({ result, selected, onSelect, emptyTitle, emptyText, snapshotRef }: Props) {
+export function MapView({ result, selected, onSelect, emptyTitle, emptyText, snapshotRef, onEdit, onUndo, onResetEdits, editCount = 0, busy }: Props) {
   const wrap = useRef<HTMLDivElement>(null)
   const cvs = useRef<HTMLCanvasElement>(null)
   const view = useRef({ cx: 0, cy: 0, scale: 1 })
   const [tg, setTg] = useState<Toggles>({ subs: true, tc: true, contours: true, shade: true, labels: true, storm: true, linework: true })
   const [tip, setTip] = useState<{ x: number; y: number; id: string } | null>(null)
   const raf = useRef(0)
+  const [mode, setMode] = useState<Mode>('view')
+  const [brush, setBrush] = useState(22) // brush radius, screen px
+  // in-progress gestures, drawn on top until the re-run result arrives
+  const gesture = useRef<{ stroke?: XY[]; dp?: { id: string; at: XY }; hover?: [number, number] }>({})
 
   // raster layers prepared once per result
   const layers = useMemo(() => {
@@ -55,7 +72,7 @@ export function MapView({ result, selected, onSelect, emptyTitle, emptyText, sna
 
   // latest state for the paint loop (observers hold the first closure)
   const live = useRef<any>({})
-  live.current = { result, layers, tg, selected }
+  live.current = { result, layers, tg, selected, mode, brush, onEdit }
 
   const fit = () => {
     const el = cvs.current
@@ -65,8 +82,15 @@ export function MapView({ result, selected, onSelect, emptyTitle, emptyText, sna
     view.current = { cx: (x0 + x1) / 2, cy: (y0 + y1) / 2, scale: 0.92 * Math.min(w / (x1 - x0), h / (y1 - y0)) }
   }
 
-  useEffect(() => { fit(); draw() }, [result])
-  useEffect(() => { draw() }, [tg, selected, layers])
+  const firstFit = useRef(true)
+  useEffect(() => {
+    // keep the view while editing: re-runs should not jump the map
+    if (firstFit.current || !result) fit()
+    firstFit.current = !result
+    gesture.current = { hover: gesture.current.hover }
+    draw()
+  }, [result])
+  useEffect(() => { draw() }, [tg, selected, layers, mode, brush])
 
   useEffect(() => {
     const el = cvs.current
@@ -170,7 +194,7 @@ export function MapView({ result, selected, onSelect, emptyTitle, emptyText, sna
           arrow(ctx, X(a[0]), Y(a[1]), X(b[0]), Y(b[1]), ctx.strokeStyle as string)
         }
         const first = s.segments[0]?.path[0]
-        if (first) { ctx.fillStyle = C('--amber'); ctx.beginPath(); ctx.arc(X(first[0]), Y(first[1]), 3, 0, 7); ctx.fill() }
+        if (first) { ctx.fillStyle = C('--amber'); ctx.beginPath(); ctx.arc(X(first[0]), Y(first[1]), (live.current as any).mode === 'tc' ? 5.5 : 3, 0, 7); ctx.fill() }
         ctx.globalAlpha = 1
       }
     }
@@ -188,6 +212,25 @@ export function MapView({ result, selected, onSelect, emptyTitle, emptyText, sna
         halo(ctx, `${s.areaAc.toFixed(2)} ac · CN ${s.cn.toFixed(0)} · Tc ${s.tcMin.toFixed(1)}`, x, y + 9, '500 10.5px "IBM Plex Mono", monospace', C('--soft'), C('--map-bg'), 'center')
       })
     }
+    // edit overlays: the stroke being painted, a design point being dragged, the brush
+    const { mode, brush } = live.current as { mode: Mode; brush: number }
+    const gs = gesture.current
+    if (gs.stroke && gs.stroke.length) {
+      const k = result.subs.findIndex((x) => x.id === selected)
+      ctx.strokeStyle = k >= 0 ? subColor(k) : C('--mint'); ctx.globalAlpha = 0.45
+      ctx.lineWidth = 2 * brush; ctx.lineCap = 'round'; ctx.lineJoin = 'round'
+      line(gs.stroke); if (gs.stroke.length === 1) { ctx.lineTo(X(gs.stroke[0][0]) + 0.1, Y(gs.stroke[0][1])) } ctx.stroke()
+      ctx.globalAlpha = 1; ctx.lineCap = 'butt'
+    }
+    if (gs.dp) {
+      const x = X(gs.dp.at[0]), y = Y(gs.dp.at[1])
+      ctx.strokeStyle = C('--amber'); ctx.lineWidth = 2; ctx.setLineDash([4, 3])
+      ctx.beginPath(); ctx.moveTo(x, y - 11); ctx.lineTo(x + 11, y); ctx.lineTo(x, y + 11); ctx.lineTo(x - 11, y); ctx.closePath(); ctx.stroke(); ctx.setLineDash([])
+    }
+    if (mode === 'area' && gs.hover && selected) {
+      ctx.strokeStyle = C('--text'); ctx.lineWidth = 1; ctx.globalAlpha = 0.7
+      ctx.beginPath(); ctx.arc(gs.hover[0], gs.hover[1], brush, 0, 7); ctx.stroke(); ctx.globalAlpha = 1
+    }
     // scale bar
     const ft = niceLen(120 / scale)
     const px = ft * scale
@@ -200,8 +243,8 @@ export function MapView({ result, selected, onSelect, emptyTitle, emptyText, sna
   useEffect(() => {
     const el = cvs.current
     if (!el) return
-    let drag: { x: number; y: number; moved: boolean } | null = null
-    const toWorld = (mx: number, my: number) => {
+    let drag: { x: number; y: number; moved: boolean; pan: boolean } | null = null
+    const toWorld = (mx: number, my: number): XY => {
       const { cx, cy, scale } = view.current
       return [cx + (mx - el.clientWidth / 2) / scale, cy - (my - el.clientHeight / 2) / scale]
     }
@@ -213,6 +256,16 @@ export function MapView({ result, selected, onSelect, emptyTitle, emptyText, sna
       if (c < 0 || r < 0 || c >= g.nx || r >= g.ny) return null
       const L = result.labels[r * g.nx + c]
       return L < 0 ? null : `S${L}`
+    }
+    const dpAt = (mx: number, my: number) => {
+      if (!result) return null
+      const { cx, cy, scale } = view.current
+      let best: string | null = null, bd = 14
+      for (const d of result.dps) {
+        const dd = Math.hypot((d.x - cx) * scale + el.clientWidth / 2 - mx, el.clientHeight / 2 - (d.y - cy) * scale - my)
+        if (dd < bd) { bd = dd; best = d.id }
+      }
+      return best
     }
     const wheel = (e: WheelEvent) => {
       e.preventDefault()
@@ -226,9 +279,31 @@ export function MapView({ result, selected, onSelect, emptyTitle, emptyText, sna
       v.cy = wy + (my - el.clientHeight / 2) / v.scale
       draw()
     }
-    const down = (e: PointerEvent) => { drag = { x: e.clientX, y: e.clientY, moved: false }; el.setPointerCapture(e.pointerId) }
+    const down = (e: PointerEvent) => {
+      const rect = el.getBoundingClientRect()
+      const mx = e.clientX - rect.left, my = e.clientY - rect.top
+      const { mode, selected } = live.current as { mode: Mode; selected: string | null }
+      el.setPointerCapture(e.pointerId)
+      const panBtn = e.button === 1 || e.button === 2
+      if (!panBtn && mode === 'area' && selected) { gesture.current.stroke = [toWorld(mx, my)]; setTip(null); draw(); drag = { x: e.clientX, y: e.clientY, moved: false, pan: false }; return }
+      if (!panBtn && mode === 'dp') { const id = dpAt(mx, my); if (id) { gesture.current.dp = { id, at: toWorld(mx, my) }; drag = { x: e.clientX, y: e.clientY, moved: false, pan: false }; return } }
+      drag = { x: e.clientX, y: e.clientY, moved: false, pan: true }
+    }
     const move = (e: PointerEvent) => {
       const rect = el.getBoundingClientRect()
+      const mx = e.clientX - rect.left, my = e.clientY - rect.top
+      gesture.current.hover = [mx, my]
+      const gs = gesture.current
+      if (drag && !drag.pan) {
+        if (Math.abs(e.clientX - drag.x) + Math.abs(e.clientY - drag.y) > 2) drag.moved = true
+        const w = toWorld(mx, my)
+        if (gs.stroke) {
+          const last = gs.stroke[gs.stroke.length - 1]
+          if (Math.hypot(w[0] - last[0], w[1] - last[1]) * view.current.scale > 4) gs.stroke.push(w)
+        } else if (gs.dp) gs.dp.at = w
+        draw()
+        return
+      }
       if (drag) {
         const dx = e.clientX - drag.x, dy = e.clientY - drag.y
         if (Math.abs(dx) + Math.abs(dy) > 2) drag.moved = true
@@ -239,15 +314,33 @@ export function MapView({ result, selected, onSelect, emptyTitle, emptyText, sna
         draw()
         return
       }
-      const id = pick(e.clientX - rect.left, e.clientY - rect.top)
-      setTip(id ? { x: e.clientX - rect.left, y: e.clientY - rect.top, id } : null)
+      if ((live.current as any).mode === 'area') draw()
+      const id = pick(mx, my)
+      setTip(id ? { x: mx, y: my, id } : null)
     }
     const up = (e: PointerEvent) => {
       const rect = el.getBoundingClientRect()
-      if (drag && !drag.moved) onSelect(pick(e.clientX - rect.left, e.clientY - rect.top))
+      const mx = e.clientX - rect.left, my = e.clientY - rect.top
+      const { mode, selected, onEdit, brush } = live.current as { mode: Mode; selected: string | null; onEdit?: (e: MapEdit) => void; brush: number }
+      const gs = gesture.current
+      if (drag && !drag.pan && gs.stroke) {
+        const s = result?.subs.find((x) => x.id === selected)
+        if (s && onEdit) onEdit({ kind: 'paint', sub: s.id, node: s.to, name: s.name, pts: gs.stroke, r: brush / view.current.scale })
+        else gs.stroke = undefined
+      } else if (drag && !drag.pan && gs.dp) {
+        if (drag.moved && onEdit) onEdit({ kind: 'dp', dp: gs.dp.id, at: gs.dp.at })
+        else gs.dp = undefined
+      } else if (drag && !drag.moved) {
+        const id = pick(mx, my)
+        if (mode === 'tc' && id && onEdit) { onSelect(id); onEdit({ kind: 'tc', sub: id, at: toWorld(mx, my) }) }
+        else onSelect(id)
+      }
       drag = null
+      draw()
     }
-    const leave = () => setTip(null)
+    const leave = () => { setTip(null); gesture.current.hover = undefined; draw() }
+    const ctxMenu = (e: Event) => e.preventDefault()
+    el.addEventListener('contextmenu', ctxMenu)
     el.addEventListener('wheel', wheel, { passive: false })
     el.addEventListener('pointerdown', down)
     el.addEventListener('pointermove', move)
@@ -259,17 +352,19 @@ export function MapView({ result, selected, onSelect, emptyTitle, emptyText, sna
       el.removeEventListener('pointermove', move)
       el.removeEventListener('pointerup', up)
       el.removeEventListener('pointerleave', leave)
+      el.removeEventListener('contextmenu', ctxMenu)
     }
   }, [result, onSelect])
 
   const zoom = (f: number) => { view.current.scale *= f; draw() }
-  const tipSub = tip && result ? result.subs.find((s) => s.id === tip.id) : null
+  const tipSub = tip && result && mode === 'view' ? result.subs.find((s) => s.id === tip.id) : null
+  const selSub = result?.subs.find((s) => s.id === selected) ?? null
   const toggle = (k: keyof Toggles) => setTg({ ...tg, [k]: !tg[k] })
   const T: [keyof Toggles, string][] = [['subs', 'Subcatchments'], ['tc', 'Tc paths'], ['labels', 'Labels'], ['storm', 'Drainage'], ['contours', 'Contours'], ['linework', 'Linework'], ['shade', 'Hillshade']]
 
   return (
     <div class="mapwrap" ref={wrap}>
-      <canvas ref={cvs} />
+      <canvas ref={cvs} class={mode !== 'view' ? `editing ${mode}` : ''} />
       {!result && (
         <div class="empty">
           <div class="t">{emptyTitle}</div>
@@ -282,7 +377,33 @@ export function MapView({ result, selected, onSelect, emptyTitle, emptyText, sna
             {T.map(([k, l]) => (
               <button class={`chip ${tg[k] ? 'on' : ''}`} onClick={() => toggle(k)}>{l}</button>
             ))}
+            {onEdit && <button class={`chip edit ${mode !== 'view' ? 'on' : ''}`} onClick={() => setMode(mode === 'view' ? 'area' : 'view')}>Edit</button>}
           </div>
+          {onEdit && mode !== 'view' && (
+            <div class="editbar">
+              <div class="modes">
+                <button class={mode === 'area' ? 'on' : ''} onClick={() => setMode('area')}>Move area</button>
+                <button class={mode === 'tc' ? 'on' : ''} onClick={() => setMode('tc')}>Tc start</button>
+                <button class={mode === 'dp' ? 'on' : ''} onClick={() => setMode('dp')}>Design point</button>
+              </div>
+              {mode === 'area' && (
+                <label class="brush">Brush<input type="range" min="6" max="70" value={brush} onInput={(e) => setBrush(+(e.target as HTMLInputElement).value)} /></label>
+              )}
+              <div class="hint">
+                {mode === 'area' && (selSub
+                  ? <>Painting into <b>{selSub.name}</b>: drag over area that should drain to it. Click another subcatchment to switch.</>
+                  : <>Click the subcatchment that should grow, then drag over the area to give it.</>)}
+                {mode === 'tc' && <>Click where a subcatchment's Tc path should start. It is traced downhill from that point.</>}
+                {mode === 'dp' && <>Drag a design point ◆ to its new location. Both conditions use the same point.</>}
+                {busy && <span class="busy"> · updating…</span>}
+              </div>
+              <div class="acts">
+                <button disabled={!editCount} onClick={onUndo}>Undo</button>
+                <button disabled={!editCount} onClick={onResetEdits}>Reset edits</button>
+                <button onClick={() => setMode('view')}>Done</button>
+              </div>
+            </div>
+          )}
           <div class="zoombtns">
             <button onClick={() => zoom(1.25)} aria-label="Zoom in">+</button>
             <button onClick={() => zoom(0.8)} aria-label="Zoom out">−</button>

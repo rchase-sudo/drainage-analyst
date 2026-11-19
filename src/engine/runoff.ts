@@ -127,7 +127,19 @@ export function addInto(dst: Float32Array, src: Float32Array) {
 /* ---------- Basin routing ---------- */
 const G = 32.174
 
-export interface Outlet { invert: number; orificeD: number; weirCrest: number | null; weirL: number; rim: number; spillL: number; /** cfs lost to infiltration while water is stored */ loss?: number }
+export interface Outlet {
+  invert: number; orificeD: number; weirCrest: number | null; weirL: number; rim: number; spillL: number
+  /** infiltration while water is stored: rate in ft/s over the wetted area at the current stage */
+  infil?: { rate: number; area: { z: number; A: number }[] }
+}
+
+/** Wetted (infiltrating) area at a stage, from a stage–area table. */
+export function areaAt(t: { z: number; A: number }[], z: number) {
+  if (!t.length) return 0
+  if (z <= t[0].z) return t[0].A
+  for (let i = 1; i < t.length; i++) if (z <= t[i].z) { const a = t[i - 1], b = t[i]; return a.A + ((b.A - a.A) * (z - a.z)) / Math.max(1e-9, b.z - a.z) }
+  return t[t.length - 1].A
+}
 
 export function outflow(o: Outlet, h: number) {
   let Q = 0
@@ -158,7 +170,7 @@ export function routeBasin(inflow: Float32Array, storage: { z: number; S: number
     const dSdz = (b.S - a.S) / Math.max(1e-9, b.z - a.z)
     return b.z + (S - Smax) / Math.max(1, dSdz)
   }
-  let S = 0, maxS = 0, maxZ = storage[0].z
+  let S = 0, maxS = 0, maxZ = storage[0].z, infCf = 0
   const sub = 12
   const h = (DT * 3600) / sub
   for (let i = 0; i < inflow.length; i++) {
@@ -168,12 +180,14 @@ export function routeBasin(inflow: Float32Array, storage: { z: number; S: number
       const I = I0 + ((I1 - I0) * (k + 0.5)) / sub
       const z = zOf(S)
       O = outflow(o, z)
-      S = Math.max(0, S + (I - O - (S > 0 ? o.loss ?? 0 : 0)) * h)
+      const L = S > 0 && o.infil ? Math.min(S / h, o.infil.rate * areaAt(o.infil.area, z)) : 0
+      infCf += L * h
+      S = Math.max(0, S + (I - O - L) * h)
     }
     out[i] = outflow(o, zOf(S))
     if (S > maxS) { maxS = S; maxZ = zOf(S) }
   }
-  return { out, maxS, maxZ, overtops: maxZ > o.rim + 1e-6 }
+  return { out, maxS, maxZ, overtops: maxZ > o.rim + 1e-6, infCf }
 }
 
 /** TR-55 Ch. 6 storage estimate (Vs/Vr) for Type II/III. */

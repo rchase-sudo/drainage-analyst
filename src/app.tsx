@@ -2,12 +2,13 @@ import { useEffect, useMemo, useRef, useState } from 'preact/hooks'
 import { exportCsv, exportDxf } from './engine/exportDxf'
 import { ROLE_LABELS } from './engine/importer'
 import { COVERS, COVER_KEYS } from './engine/runoff'
-import { DEFAULT_SETTINGS, type AnalysisResult, type Condition, type LayerInfo, type Role, type Settings } from './engine/types'
+import { DEFAULT_SETTINGS, type AnalysisResult, type BmpSetting, type Condition, type Edits, type LayerInfo, type Role, type Settings } from './engine/types'
+import type { XY } from './engine/geometry'
 import type { WorkerIn, WorkerOut } from './worker'
 import { aiReady, delineate, loadAi, saveAi, type AiConfig } from './ai'
 import type { AiModel } from './engine/types'
 import { CompareView } from './ui/Compare'
-import { MapView } from './ui/MapView'
+import { MapView, type MapEdit } from './ui/MapView'
 import { BasinCards, DPTable, Kpis, SubDetail, SubTable } from './ui/Results'
 
 type DistributiveOmit<T, K extends keyof any> = T extends any ? Omit<T, K> : never
@@ -39,6 +40,19 @@ export function App() {
   const [settings, setSettings] = useState<Settings>(loadSettings)
   const [drawer, setDrawer] = useState(false)
   const [sel, setSel] = useState<Record<Condition, string | null>>({ pre: null, post: null })
+  // manual map edits: per-condition area moves and Tc starts, design point moves shared by both
+  type EditState = { pre: Omit<Edits, 'dp'>; post: Omit<Edits, 'dp'>; dp: Record<string, XY> }
+  const noEdits = (): EditState => ({ pre: { paint: [], tcStart: {} }, post: { paint: [], tcStart: {} }, dp: {} })
+  const edits = useRef<EditState>(noEdits())
+  const undoStack = useRef<EditState[]>([])
+  const [editCount, setEditCount] = useState(0)
+  const editsFor = (c: Condition): Edits => ({ ...edits.current[c], dp: edits.current.dp })
+  const resetEdits = (which?: Condition) => {
+    if (which) edits.current = { ...edits.current, [which]: { paint: [], tcStart: {} } }
+    else edits.current = noEdits()
+    undoStack.current = []
+    setEditCount(0)
+  }
   const live = useRef({ st, settings })
   live.current = { st, settings }
   const snap = useRef<(() => string) | null>(null)
@@ -76,7 +90,9 @@ export function App() {
   const runP = (c: Condition, o: { model?: AiModel | null; required?: DP[] | null } = {}) => {
     const cur = live.current.st[c]
     patch(c, { status: 'running', msg: 'Starting', error: '' })
-    const p = call<AnalysisResult>({ type: 'run', condition: c, roles: cur.roles, settings: live.current.settings, model: o.model, required: o.required })
+    // a new Claude delineation renumbers subcatchments, so area moves and Tc starts made on the old one no longer apply
+    if (o.model) resetEdits(c)
+    const p = call<AnalysisResult>({ type: 'run', condition: c, roles: cur.roles, settings: live.current.settings, model: o.model, required: o.required, edits: editsFor(c) })
     latest.current[c] = reqId.current
     return p
   }
@@ -196,6 +212,7 @@ export function App() {
     patch(c, { status: 'loading', msg: 'Reading file', error: '', result: null })
     const files = await Promise.all(ok.map(async (f) => ({ name: f.name, text: await f.text() })))
     setTab(c)
+    resetEdits()
     await call({ type: 'load', condition: c, files })
     pipeline({ claude: aiRef.current.auto })
   }
@@ -242,6 +259,7 @@ export function App() {
   }
 
   const clear = async (c: Condition) => {
+    resetEdits()
     await call({ type: 'clear', condition: c })
     setSt((s) => ({ ...s, [c]: blank() }))
     live.current.st = { ...live.current.st, [c]: blank() }
@@ -259,6 +277,26 @@ export function App() {
     patch(c, { roles })
     live.current.st = { ...live.current.st, [c]: { ...live.current.st[c], roles } }
     schedule()
+  }
+  const applyEdit = (c: Condition, e: MapEdit) => {
+    undoStack.current.push(JSON.parse(JSON.stringify(edits.current)))
+    const cur = edits.current
+    if (e.kind === 'paint') cur[c] = { ...cur[c], paint: [...cur[c].paint, { sub: e.sub, node: e.node, name: e.name, pts: e.pts, r: e.r }] }
+    else if (e.kind === 'tc') cur[c] = { ...cur[c], tcStart: { ...cur[c].tcStart, [e.sub]: e.at } }
+    else cur.dp = { ...cur.dp, [e.dp]: e.at }
+    setEditCount(undoStack.current.length)
+    schedule()
+  }
+  const undoEdit = () => {
+    const prev = undoStack.current.pop()
+    if (!prev) return
+    edits.current = prev
+    setEditCount(undoStack.current.length)
+    schedule()
+  }
+  const setBmp = (name: string, v: BmpSetting) => {
+    const cur = live.current.settings
+    applySettings({ ...cur, bmp: { ...(cur.bmp ?? {}), [name]: { ...(cur.bmp?.[name] ?? {}), ...v } } })
   }
   const applySettings = (s: Settings) => {
     setSettings(s)
@@ -376,6 +414,11 @@ export function App() {
           snapshotRef={snap}
           snapshot={snapshot}
           preReady={!!st.pre.result}
+          onEdit={(e) => applyEdit(tab as Condition, e)}
+          onUndo={undoEdit}
+          onResetEdits={() => { resetEdits(); schedule() }}
+          editCount={editCount}
+          onBmp={setBmp}
         />
       )}
       {tab === 'compare' &&
@@ -418,6 +461,11 @@ function CondPanel(p: {
   snapshotRef: { current: (() => string) | null }
   snapshot: string
   preReady: boolean
+  onEdit: (e: MapEdit) => void
+  onUndo: () => void
+  onResetEdits: () => void
+  editCount: number
+  onBmp: (name: string, v: BmpSetting) => void
 }) {
   const { c, s } = p
   const [over, setOver] = useState(false)
@@ -507,6 +555,11 @@ function CondPanel(p: {
           result={r}
           selected={p.selected}
           onSelect={p.onSelect}
+          onEdit={p.onEdit}
+          onUndo={p.onUndo}
+          onResetEdits={p.onResetEdits}
+          editCount={p.editCount}
+          busy={busy}
           snapshotRef={p.snapshotRef}
           emptyTitle={busy ? 'Analyzing…' : `Drop the ${label} plan to start`}
           emptyText={busy ? s.msg : 'Subcatchments, Tc paths, design points and peak flows are generated automatically from the surface and drainage features in your drawing.'}
@@ -532,7 +585,7 @@ function CondPanel(p: {
             <SubTable r={r} selected={p.selected} onSelect={(id) => p.onSelect(id)} />
             {selSub && <SubDetail r={r} s={selSub} />}
             {!selSub && r.subs[0] && <SubDetail r={r} s={r.subs[0]} />}
-            <BasinCards r={r} />
+            <BasinCards r={r} onBmp={p.onBmp} />
             {r.aiNotes && (
               <div class="mock" style="margin-top:16px">
                 <div class="mock__flag ok">Subcatchments drawn by Claude</div>
@@ -641,16 +694,10 @@ function SettingsDrawer({ s, units, onChange, onClose, ai, onAi }: { ai: AiConfi
             </>
           )
         })()}
-        <div class="eyebrow" style="margin-top:22px"><span>Proposed roofs → infiltration trench</span></div>
-        <div class="field"><span>Roofs drain to trenches</span>
-          <select value={d.roofTrench === false ? 'no' : 'yes'} onChange={(e) => set('roofTrench', (e.target as HTMLSelectElement).value === 'yes')}>
-            <option value="yes">Yes</option><option value="no">No</option>
-          </select>
-        </div>
-        <div class="field"><span>Width (ft)</span><input type="number" step="0.5" value={d.trenchWidth ?? 2} onInput={(e) => set('trenchWidth', num((e.target as HTMLInputElement).value, 2))} /></div>
-        <div class="field"><span>Depth (ft)</span><input type="number" step="0.5" value={d.trenchDepth ?? 4} onInput={(e) => set('trenchDepth', num((e.target as HTMLInputElement).value, 4))} /></div>
+        <div class="eyebrow" style="margin-top:22px"><span>Drawn infiltration trenches — defaults</span></div>
+        <p class="note">Used for any trench on the drawing that has no depth or voids of its own. Set each BMP's infiltration rate (and a trench's own depth and voids) in its card under Results.</p>
+        <div class="field"><span>Stone depth (ft)</span><input type="number" step="0.5" value={d.trenchDepth ?? 4} onInput={(e) => set('trenchDepth', num((e.target as HTMLInputElement).value, 4))} /></div>
         <div class="field"><span>Stone voids</span><input type="number" step="0.05" value={d.trenchVoids ?? 0.4} onInput={(e) => set('trenchVoids', num((e.target as HTMLInputElement).value, 0.4))} /></div>
-        <div class="field"><span>Infiltration (in/hr, 0 = storage only)</span><input type="number" step="0.1" value={d.trenchInfil ?? 0} onInput={(e) => set('trenchInfil', num((e.target as HTMLInputElement).value, 0))} /></div>
         <div class="field"><span>Resolution</span>
           <select value={String(d.targetCells)} onChange={(e) => set('targetCells', +(e.target as HTMLSelectElement).value)}>
             <option value="90000">Fast</option>

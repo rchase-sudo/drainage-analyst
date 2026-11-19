@@ -8,7 +8,7 @@ import {
   COVERS, COVER_KEYS, DT, NSTEP, Outlet, addInto, routeBasin, stats, subHydrograph, tr55StorageRatio,
 } from './runoff'
 import type {
-  AiContext, AiModel, AnalysisResult, BasinResult, Condition, CoverKey, CoverRow, DesignPoint, Drawing, Ent, OutletDesign, Role, Settings, Structure,
+  AiContext, AiModel, AnalysisResult, BasinResult, Condition, CoverKey, CoverRow, DesignPoint, Drawing, Edits, Ent, OutletDesign, Role, Settings, Structure,
   Subcatchment, TcSegment, V3,
 } from './types'
 
@@ -27,6 +27,8 @@ export interface AnalyzeOptions {
   siteRings?: Ring[]
   /** Existing peaks by DP id → per storm, for outlet design. */
   prePeaks?: Record<string, number[]>
+  /** manual edits: area moved between subcatchments, Tc starts, design point locations */
+  edits?: Edits
   onProgress?: (msg: string) => void
 }
 
@@ -312,6 +314,45 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
   const basinCell = new Int32Array(N).fill(-1)
   basinsIn.forEach((r, b) => rasterizeRing(r, grid, (i) => { if (valid[i]) basinCell[i] = b }))
   const inBasin = (x: number, y: number) => basinsIn.findIndex((r) => pointInRing(x, y, r))
+  // A drawn BMP is a stone infiltration trench when its layer or label says so, or when it is a long thin
+  // shape (under ~6 ft wide); otherwise it is a surface basin (pond, bioretention, rain garden …)
+  const trenchRx = /TRENCH|DRY.?WELL|STONE.?(BED|TRENCH|RESERVOIR)|INFILTRATION.?(TRENCH|BED|GALLER)|CHAMBER|DRIP.?EDGE/i
+  const ringPerim = (r: Ring) => r.reduce((a, v, k) => a + Math.hypot(r[(k + 1) % r.length][0] - v[0], r[(k + 1) % r.length][1] - v[1]), 0)
+  const nearRing = (x: number, y: number, r: Ring, d: number) => {
+    if (pointInRing(x, y, r)) return true
+    for (let k = 0; k < r.length; k++) {
+      const a = r[k], b = r[(k + 1) % r.length], dx = b[0] - a[0], dy = b[1] - a[1], L = dx * dx + dy * dy || 1
+      const u = Math.max(0, Math.min(1, ((x - a[0]) * dx + (y - a[1]) * dy) / L))
+      if (Math.hypot(x - a[0] - u * dx, y - a[1] - u * dy) < d) return true
+    }
+    return false
+  }
+  const basinEnts = byRole('basin')
+  const bmpKind: ('trench' | 'basin')[] = basinsIn.map((r) => {
+    const A = Math.abs(polyArea(r)), P = ringPerim(r)
+    const byLayer = basinEnts.some((e) => trenchRx.test(e.layer) && e.pts.length && e.pts.some((v) => nearRing(v[0], v[1], r, 1)))
+    const byLabel = allTexts.some((t) => trenchRx.test(t.text ?? '') && nearRing(t.pts[0][0], t.pts[0][1], r, 15))
+    return byLayer || byLabel || (P > 0 && (2 * A) / P < 6) ? 'trench' : 'basin'
+  })
+  const bmpName: string[] = []
+  {
+    let nt = 0, nb = 0
+    bmpKind.forEach((k) => bmpName.push(k === 'trench' ? `Trench ${++nt}` : `Basin ${++nb}`))
+  }
+  /** Drawn trench (basin index) beside a roof outline: the roof drains to it. */
+  const trenchBeside = (roof: Ring) => {
+    let best = -1, bd = 20
+    basinsIn.forEach((r, b) => {
+      if (bmpKind[b] !== 'trench') return
+      for (const v of r) for (let k = 0; k < roof.length; k++) {
+        const a = roof[k], c = roof[(k + 1) % roof.length], dx = c[0] - a[0], dy = c[1] - a[1], L = dx * dx + dy * dy || 1
+        const u = Math.max(0, Math.min(1, ((v[0] - a[0]) * dx + (v[1] - a[1]) * dy) / L))
+        const dd = Math.hypot(v[0] - a[0] - u * dx, v[1] - a[1] - u * dy)
+        if (dd < bd) { bd = dd; best = b }
+      }
+    })
+    return best
+  }
 
   const storm = byRole('storm')
   const structures: (Structure & { cell: number; comp: number })[] = []
@@ -807,6 +848,13 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
     p.name = `DP-${nextNo}`
     usedIds.add(p.id)
   }
+  // design points the user moved on the map
+  for (const p of dpList) {
+    const m = opt.edits?.dp?.[p.id]
+    if (!m) continue
+    const c = nearestValid(m[0], m[1], Math.ceil(40 / cs))
+    if (c >= 0) p.cell = c
+  }
   if (condition === 'post' && opt.forcedDPs?.length)
     for (const p of dpList) if (!opt.forcedDPs.some((f) => f.id === p.id)) warnings.push(`${p.name} is a new outfall in the proposed condition with no existing counterpart.`)
 
@@ -897,43 +945,10 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
       cur = receiver.get(cur)
     }
   }
-  // infiltration trenches along proposed roof drip edges: extra basin nodes after the drawn basins
-  const trenchSpecs: { name: string; edges: XY[][]; recv: string }[] = []
   const nodeName = (id: string): string => {
     if (id.startsWith('D')) return dpList[+id.slice(1)]?.name ?? id
     if (id.startsWith('I')) return inlets[+id.slice(1)]?.name ?? id
-    const b = +id.slice(1)
-    return b >= basinsIn.length ? trenchSpecs[b - basinsIn.length]?.name ?? id : `Basin ${b + 1}`
-  }
-  const proposedRoof = (ring: Ring, buildingId?: string) => {
-    if (condition !== 'post' || S.roofTrench === false) return false
-    if (buildingId) { const k = +buildingId.replace(/\D/g, '') - 1; if (roofRings[k]) return !roofRings[k].existing }
-    const c = centroid(ring)
-    const hit = roofRings.find((q) => pointInRing(c[0], c[1], q.ring))
-    return hit ? !hit.existing : true
-  }
-  /** Eave lines when none are given: the roof edges facing lower ground, longest first, up to half the perimeter. */
-  const dripEdges = (ring: Ring): XY[][] => {
-    const ccw = polyArea(ring) > 0
-    const edges = ring.map((a, k) => {
-      const b = ring[(k + 1) % ring.length]
-      const L = Math.hypot(b[0] - a[0], b[1] - a[1])
-      const nxv = ccw ? (b[1] - a[1]) / L : -(b[1] - a[1]) / L, nyv = ccw ? -(b[0] - a[0]) / L : (b[0] - a[0]) / L
-      const zz = zAt((a[0] + b[0]) / 2 + nxv * 6, (a[1] + b[1]) / 2 + nyv * 6)
-      return { a, b, L, zz: Number.isNaN(zz) ? Infinity : zz }
-    }).filter((e) => e.L > 3)
-    const per = edges.reduce((t, e) => t + e.L, 0)
-    const med = [...edges].sort((x, y) => x.zz - y.zz)[Math.floor(edges.length / 2)]?.zz ?? Infinity
-    const out: XY[][] = []
-    let got = 0
-    for (const e of edges.filter((e) => e.zz <= med).sort((x, y) => y.L - x.L)) { if (got >= 0.5 * per) break; out.push([e.a, e.b]); got += e.L }
-    return out.length ? out : [[ring[0], ring[1]]]
-  }
-  const addTrench = (name: string, edges: XY[][], recv: string) => {
-    trenchSpecs.push({ name: `Trench ${name}`, edges, recv })
-    const id = `B${basinsIn.length + trenchSpecs.length - 1}`
-    receiver.set(id, recv)
-    return id
+    return bmpName[+id.slice(1)] ?? id
   }
   mark('network')
 
@@ -1016,11 +1031,11 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
       if (sb.kind !== 'roof') surfaceUnit.set(node, u)
       const name = String(sb.name || `S-${u + 1}`).slice(0, 16)
       let note = sb.note
-      if (sb.kind === 'roof' && proposedRoof(sb.ring, sb.building)) {
-        const edges = sb.drip?.filter((e) => e.length >= 2).length ? sb.drip!.filter((e) => e.length >= 2) : dripEdges(sb.ring)
-        const recvName = nodeName(node)
-        node = addTrench(name, edges, node)
-        note = `${S.trenchWidth ?? 2}' × ${S.trenchDepth ?? 4}' infiltration trench along the drip edge, overflow to ${recvName}.${note ? ' ' + note : ''}`
+      if (sb.kind === 'roof') {
+        // a roof with a drawn infiltration trench beside it drains to the trench; the trench's overflow then
+        // follows the ground (or its pipe) to wherever that water goes
+        const t = trenchBeside(sb.ring)
+        if (t >= 0) { node = `B${t}`; note = `Drains to ${bmpName[t]} (drawn).${note ? ' ' + note : ''}` }
       }
       unitKeys.push(`A${u}|${node}`)
       aiUnit[u] = { name, node, note, path: sb.path, roof: sb.kind === 'roof', ord }
@@ -1057,32 +1072,58 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
   }
 
 
-  // Without Claude, proposed roofs still become their own subcatchments draining to drip-edge trenches
-  if (!opt.model?.subs.length && condition === 'post' && S.roofTrench !== false) {
+  // Without Claude, a roof with a drawn infiltration trench beside it becomes its own subcatchment draining to the trench
+  if (!opt.model?.subs.length) {
     let k = 0
     for (const rr of roofRings) {
-      if (rr.existing) continue
+      const t = trenchBeside(rr.ring)
+      if (t < 0) continue
       const cells: number[] = []
-      rasterizeRing(rr.ring, grid, (i) => { if (valid[i]) cells.push(i) })
+      rasterizeRing(rr.ring, grid, (i) => { if (valid[i] && labels[i] >= 0) cells.push(i) })
       if (cells.length < 2) continue
-      k++
-      const edges = dripEdges(rr.ring)
-      const [a, b] = edges[0]
-      const L = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1
-      const mx = (a[0] + b[0]) / 2, my = (a[1] + b[1]) / 2
-      const cand = [[mx + ((b[1] - a[1]) / L) * 6, my - ((b[0] - a[0]) / L) * 6], [mx - ((b[1] - a[1]) / L) * 6, my + ((b[0] - a[0]) / L) * 6]]
-      const out = cand.find((p) => !pointInRing(p[0], p[1], rr.ring)) ?? cand[0]
-      let oc = cellAt(out[0], out[1])
-      if (oc < 0 || !valid[oc]) oc = nearestValid(out[0], out[1], Math.ceil(30 / cs))
-      const recv = oc >= 0 ? nodeOfCell(oc) : nearestDP(mx, my)
-      const name = `R-${k}`
-      const node = addTrench(name, edges, recv)
+      const name = `R-${++k}`
+      const node = `B${t}`
       const u = unitKeys.length
       unitKeys.push(`A${u}|${node}`)
-      aiUnit[u] = { name, node, roof: true, ord: -1000 + k, engine: true, note: `To ${S.trenchWidth ?? 2}' × ${S.trenchDepth ?? 4}' infiltration trench along the drip edge (downslope eaves, estimated from the ground); overflow to ${nodeName(recv)}` }
+      aiUnit[u] = { name, node, roof: true, ord: -1000 + k, engine: true, note: `Roof to ${bmpName[t]} (drawn).` }
       for (const i of cells) labels[i] = u
     }
   }
+
+  /* ---------------- manual edits: area moved between subcatchments ---------------- */
+  const unitNode = (u: number) => { const key = unitKeys[u]; return aiUnit[u]?.node ?? (key[0] === 'V' ? key.slice(1) : key.split('|').pop()!) }
+  const unitFor = (node: string, name?: string) => {
+    let hit = -1
+    for (let u = 0; u < unitKeys.length; u++) if (unitNode(u) === node) { if (name && aiUnit[u]?.name === name) return u; if (hit < 0) hit = u }
+    return hit
+  }
+  for (const st of opt.edits?.paint ?? []) {
+    const byId = +st.sub.replace(/^S/, '')
+    let u = byId >= 0 && byId < unitKeys.length && unitNode(byId) === st.node ? byId : unitFor(st.node, st.name)
+    if (u < 0) {
+      // the target has no area yet (an inlet or design point the user is giving its first area): new unit
+      if (!nodeIds0().has(st.node)) continue
+      u = unitKeys.length
+      unitKeys.push(st.node)
+    }
+    const r = Math.max(cs * 0.75, st.r), rc = Math.ceil(r / cs)
+    for (let k = 0; k < st.pts.length; k++) {
+      const a = st.pts[Math.max(0, k - 1)], b = st.pts[k]
+      const n = Math.max(1, Math.ceil(Math.hypot(b[0] - a[0], b[1] - a[1]) / (cs / 2)))
+      for (let t = 0; t <= n; t++) {
+        const x = a[0] + ((b[0] - a[0]) * t) / n, y = a[1] + ((b[1] - a[1]) * t) / n
+        const c0 = Math.floor((x - grid.x0) / cs), r0 = Math.floor((y - grid.y0) / cs)
+        for (let dr = -rc; dr <= rc; dr++) for (let dc = -rc; dc <= rc; dc++) {
+          const c = c0 + dc, rr = r0 + dr
+          if (c < 0 || rr < 0 || c >= nx || rr >= ny) continue
+          const i = rr * nx + c
+          if (labels[i] < 0 || !valid[i]) continue
+          if (Math.hypot(grid.x0 + (c + 0.5) * cs - x, grid.y0 + (rr + 0.5) * cs - y) <= r) labels[i] = u
+        }
+      }
+    }
+  }
+  function nodeIds0() { return new Set<string>([...dpList.map((_, k) => `D${k}`), ...inlets.map((_, k) => `I${k}`), ...basinsIn.map((_, k) => `B${k}`)]) }
 
   /* ---------------- per-unit stats: area, CN, cover table ---------------- */
   say('Computing curve numbers')
@@ -1151,6 +1192,12 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
   for (let u = 0; u < U; u++) {
     const ai = aiUnit[u]
     if (ai?.roof) { tcOf.push({ tc: 0, segs: [] }); continue } // roofs: minimum Tc
+    const ts = opt.edits?.tcStart?.[`S${u}`]
+    if (ts) {
+      // the user placed the start of this Tc path: trace downhill from there by the same rules
+      const c = cellAt(ts[0], ts[1])
+      if (c >= 0 && valid[c] && !Number.isNaN(z[c])) { const r = detailTc(c); if (r.tc > 0) { tcOf.push(r); continue } }
+    }
     if (ai?.path && ai.path.length >= 2) {
       // Tc along the flow path Claude drew, by the same TR-55 rules
       const cells: number[] = []
@@ -1291,7 +1338,7 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
   subs.sort((a, b) => ordOf(a) - ordOf(b))
 
   /* ---------------- node routing ---------------- */
-  const nodeIds = new Set<string>([...dpList.map((_, k) => `D${k}`), ...inlets.map((_, k) => `I${k}`), ...basinsIn.map((_, k) => `B${k}`), ...trenchSpecs.map((_, k) => `B${basinsIn.length + k}`)])
+  const nodeIds = nodeIds0()
   const ns = S.storms.length
   const blank = () => S.storms.map(() => new Float32Array(NSTEP + 1))
   const inflow = new Map<string, Float32Array[]>()
@@ -1313,10 +1360,36 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
     if (to) { indeg.set(to, indeg.get(to)! - 1); if (!indeg.get(to)) q.push(to) }
   }
 
-  // basin geometry
+  // BMP geometry: surface basins store water above the ground in the polygon; trenches store it in stone voids
+  const bmpSet = (b: number) => S.bmp?.[bmpName[b]] ?? {}
+  const infilOf: (Outlet['infil'] | undefined)[] = []
+  const trenchOutlet = new Map<number, Outlet>()
   const basins: BasinResult[] = basinsIn.map((ring, b) => {
     const cells: number[] = []
     for (let i = 0; i < N; i++) if (basinCell[i] === b) cells.push(i)
+    const set = bmpSet(b)
+    const rate = Math.max(0, set.infil ?? 0)
+    const ftps = rate / 12 / 3600
+    if (bmpKind[b] === 'trench') {
+      const A = Math.max(cs * cs, Math.abs(polyArea(ring)))
+      const P = ringPerim(ring)
+      const w = Math.max(0.5, (2 * A) / P), len = Math.max(w, P / 2 - w)
+      let zs = 0, zn = 0
+      for (let k = 0; k < ring.length; k++) { const zz = zAt(ring[k][0], ring[k][1]); if (!Number.isNaN(zz)) { zs += zz; zn++ } }
+      for (const i of cells) if (!Number.isNaN(z[i])) { zs += z[i]; zn++ }
+      const rim = zn ? zs / zn : 0
+      const depth = Math.max(0.5, set.depth ?? S.trenchDepth ?? 4), voids = Math.min(0.95, Math.max(0.05, set.voids ?? S.trenchVoids ?? 0.4))
+      const bottom = rim - depth, cap = A * depth * voids
+      if (ftps > 0) infilOf[b] = { rate: ftps, area: [{ z: bottom, A }, { z: rim + 1, A }] }
+      // overflow spills along the trench length once the stone is full
+      trenchOutlet.set(b, { invert: rim, orificeD: 0, weirCrest: null, weirL: 0, rim, spillL: Math.max(4, len) })
+      return {
+        id: `B${b}`, name: bmpName[b], ring, bottom, rim, kind: 'trench' as const, lengthFt: len, infil: rate,
+        storage: [{ z: bottom, S: 0 }, { z: rim, S: cap }, { z: rim + 1, S: cap + A }], maxStorage: cap,
+        outflowTo: nodeName(receiver.get(`B${b}`) ?? 'D0'), piped: pipedBasin.has(b), inflow: [],
+        trench: { width: w, depth, voids, storageCf: cap, results: [] },
+      }
+    }
     let bottom = Infinity
     for (const i of cells) bottom = Math.min(bottom, z[i])
     // rim = lowest elevation along the polygon boundary
@@ -1332,55 +1405,27 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
     }
     if (!Number.isFinite(rim) || rim <= bottom) rim = bottom + 0.5
     const storage: { z: number; S: number }[] = []
+    const area: { z: number; A: number }[] = []
     const steps = 24
     for (let k = 0; k <= steps; k++) {
       const h = bottom + ((rim - bottom) * k) / steps
-      let Sv = 0
-      for (const i of cells) if (h > z[i]) Sv += (h - z[i]) * cs * cs
+      let Sv = 0, n = 0
+      for (const i of cells) if (h > z[i]) { Sv += (h - z[i]) * cs * cs; n++ }
       storage.push({ z: h, S: Sv })
+      area.push({ z: h, A: Math.max(1, n) * cs * cs })
     }
     // extend one foot above rim for overtopping
     const top = storage[storage.length - 1]
     const areaRim = cells.length * cs * cs
     storage.push({ z: rim + 1, S: top.S + areaRim })
+    area.push({ z: rim + 1, A: areaRim })
+    if (ftps > 0) infilOf[b] = { rate: ftps, area }
     return {
-      id: `B${b}`, name: `Basin ${b + 1}`, ring, bottom, rim, storage, maxStorage: top.S,
+      id: `B${b}`, name: bmpName[b], ring, bottom, rim, storage, maxStorage: top.S, infil: rate,
       outflowTo: nodeName(receiver.get(`B${b}`) ?? 'D0'), piped: pipedBasin.has(b), inflow: [],
     }
   })
-
-  // trench geometry: prismatic stone storage along each drip edge
-  const tw = S.trenchWidth ?? 2, td = S.trenchDepth ?? 4, tv = S.trenchVoids ?? 0.4, ti = S.trenchInfil ?? 0
-  const buffer = (line: XY[], half: number): Ring => {
-    const L: XY[] = [], R: XY[] = []
-    for (let k = 0; k < line.length; k++) {
-      const a = line[Math.max(0, k - 1)], b = line[Math.min(line.length - 1, k + 1)]
-      const dx = b[0] - a[0], dy = b[1] - a[1], m = Math.hypot(dx, dy) || 1
-      L.push([line[k][0] - (dy / m) * half, line[k][1] + (dx / m) * half])
-      R.push([line[k][0] + (dy / m) * half, line[k][1] - (dx / m) * half])
-    }
-    return [...L, ...R.reverse()]
-  }
-  const trenchOutlets: Outlet[] = []
-  trenchSpecs.forEach((t, j) => {
-    let len = 0, zs = 0, zn = 0
-    for (const e of t.edges) for (let k = 1; k < e.length; k++) {
-      const a = e[k - 1], b = e[k]
-      len += Math.hypot(b[0] - a[0], b[1] - a[1])
-      const zz = zAt((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
-      if (!Number.isNaN(zz)) { zs += zz; zn++ }
-    }
-    len = Math.max(4, len)
-    const rim = zn ? zs / zn : 0, bottom = rim - td
-    const cap = len * tw * tv * td
-    const parts = t.edges.map((e) => buffer(e, tw / 2))
-    basins.push({
-      id: `B${basinsIn.length + j}`, name: t.name, ring: parts[0], parts, bottom, rim,
-      storage: [{ z: bottom, S: 0 }, { z: rim, S: cap }, { z: rim + 1, S: cap + len * tw }],
-      maxStorage: cap, outflowTo: nodeName(t.recv), piped: false, inflow: [], kind: 'trench', lengthFt: len,
-    })
-    trenchOutlets.push({ invert: rim, orificeD: 0, weirCrest: null, weirL: 0, rim, spillL: len, loss: ((ti / 12) / 3600) * len * tw })
-  })
+  const withInfil = (b: number, o: Outlet): Outlet => (infilOf[b] ? { ...o, infil: infilOf[b] } : o)
 
   const outflowOf = new Map<string, Float32Array[]>()
   const dpTarget = (id: string): string => {
@@ -1399,7 +1444,7 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
         const b = +id.slice(1)
         const o = outlets.get(b)
         if (o) {
-          const runs = inH.map((h) => routeBasin(h, basins[b].storage, o))
+          const runs = inH.map((h) => routeBasin(h, basins[b].storage, withInfil(b, o)))
           basinRuns.set(b, runs)
           outH = runs.map((r) => r.out)
         }
@@ -1413,13 +1458,14 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
 
   // outlet design
   const outlets = new Map<number, Outlet | null>()
-  basins.forEach((_, b) => outlets.set(b, null))
-  trenchOutlets.forEach((o, j) => outlets.set(basinsIn.length + j, o))
+  basins.forEach((_, b) => outlets.set(b, trenchOutlet.get(b) ?? null))
   let net = runNetwork(outlets)
   basins.forEach((B, b) => (B.inflow = net.acc2.get(`B${b}`)!.map((h) => { const st = stats(h); return { peak: st.peak, volAcFt: st.vol } })))
-  if (basinsIn.length && opt.prePeaks) {
+  const surfaceBasins = basins.filter((B) => B.kind !== 'trench').length
+  if (surfaceBasins && opt.prePeaks) {
     say('Sizing basin outlets')
     for (let b = 0; b < basinsIn.length; b++) {
+      if (bmpKind[b] === 'trench') continue
       const B = basins[b]
       const target = dpTarget(`B${b}`)
       const pre = opt.prePeaks[dpList[+target.slice(1)]?.id ?? '']
@@ -1429,9 +1475,9 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
       B.outlet = des.design
       net = runNetwork(outlets)
     }
-  } else if (basinsIn.length) {
+  } else if (surfaceBasins) {
     // without existing peaks, route through a nominal 12" orifice so storage still attenuates
-    basinsIn.forEach((_, b) => outlets.set(b, { invert: basins[b].bottom, orificeD: 1, weirCrest: null, weirL: 0, rim: basins[b].rim, spillL: 10 }))
+    basinsIn.forEach((_, b) => { if (bmpKind[b] !== 'trench') outlets.set(b, { invert: basins[b].bottom, orificeD: 1, weirCrest: null, weirL: 0, rim: basins[b].rim, spillL: 10 }) })
     net = runNetwork(outlets)
     warnings.push('Basin outlets are not sized yet. Analyze the existing condition so Drainage Analyst can size them to match existing peaks.')
   }
@@ -1443,7 +1489,7 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
     const other = dpAll.map((h, k) => { const o = h.slice(); for (let i = 0; i < o.length; i++) o[i] -= myOut[k][i]; return o })
     const peakWith = (k: number, out: Float32Array) => { let p = 0; for (let i = 0; i < out.length; i++) p = Math.max(p, other[k][i] + out[i]); return p }
     const sizes = [2, 3, 4, 5, 6, 8, 10, 12, 15, 18, 21, 24, 30, 36]
-    const mk = (D: number, crest: number | null, L: number): Outlet => ({ invert: B.bottom, orificeD: D / 12, weirCrest: crest, weirL: L, rim: B.rim, spillL: 10 })
+    const mk = (D: number, crest: number | null, L: number): Outlet => withInfil(b, { invert: B.bottom, orificeD: D / 12, weirCrest: crest, weirL: L, rim: B.rim, spillL: 10 })
     const sm = S.storms.map((s, k) => k).sort((a, c) => S.storms[a].P - S.storms[c].P)
     const k0 = sm[0]
     let D = sizes[0]
@@ -1487,21 +1533,18 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
     return { outlet: bestO, design }
   }
 
-  trenchSpecs.forEach((_, j) => {
-    const b = basinsIn.length + j
-    const B = basins[b]
+  // final per-BMP results: trench fill / overflow, and the volume each BMP infiltrated
+  basins.forEach((B, b) => {
     const inH = net.acc2.get(`B${b}`)!
     B.inflow = inH.map((h) => { const st = stats(h); return { peak: st.peak, volAcFt: st.vol } })
-    const runs = inH.map((h) => routeBasin(h, B.storage, trenchOutlets[j]))
-    B.trench = {
-      width: tw, depth: td, voids: tv, storageCf: B.maxStorage,
-      results: runs.map((r, k) => ({ peakIn: stats(inH[k]).peak, peakOut: stats(r.out).peak, maxDepth: Math.max(0, r.maxZ - B.bottom), overflows: stats(r.out).peak > 0.005 })),
-    }
+    const o = outlets.get(b)
+    if (!o) return
+    const runs = inH.map((h) => routeBasin(h, B.storage, withInfil(b, o)))
+    if (infilOf[b]) B.infiltrated = runs.map((r) => r.infCf / AC)
+    if (B.trench) B.trench.results = runs.map((r, k) => ({ peakIn: stats(inH[k]).peak, peakOut: stats(r.out).peak, maxDepth: Math.max(0, r.maxZ - B.bottom), overflows: stats(r.out).peak > 0.005 }))
   })
-  if (trenchSpecs.length) {
-    const tot = basins.filter((B) => B.kind === 'trench').reduce((a, B) => a + (B.lengthFt ?? 0), 0)
-    warnings.push(`${trenchSpecs.length} proposed roof${trenchSpecs.length > 1 ? 's' : ''} drain to ${tw}' × ${td}' infiltration trenches (${(tv * 100).toFixed(0)}% voids, ${Math.round(tot)} ft total${ti ? `, ${ti} in/hr infiltration` : ', storage only'}).`)
-  }
+  const tr = basins.filter((B) => B.kind === 'trench')
+  if (tr.length) warnings.push(`${tr.length} drawn infiltration trench${tr.length > 1 ? 'es' : ''} modeled as stone storage; overflow is routed to where it spills. Set depth, voids and infiltration per trench in its card.`)
 
   const dps: DesignPoint[] = dpList.map((p, k) => {
     const h = net.acc2.get(`D${k}`)!
@@ -1575,7 +1618,7 @@ export function analyze(d: Drawing, condition: Condition, S: Settings, opt: Anal
         const act = wi ? (wi.barrierFt > wi.flushFt ? 'top of wall stands above the uphill ground: it blocks and redirects surface flow' : 'flush with the ground: flow passes over it') : ''
         return { line, label: `${act}${lab ? ' — ' + lab : ''}`.slice(0, 240) }
       }),
-      basins: basins.filter((B) => B.kind !== 'trench').map((B) => ({ name: B.name, ring: B.ring })),
+      basins: basins.map((B) => ({ name: B.name, ring: B.ring, kind: B.kind ?? 'basin' })),
       dps: dps.map((p) => ({ name: p.name, x: p.x, y: p.y })),
       texts,
       elev: { x0: box.x0, y0: box.y0, step, nx: ex, ny: ey, z: ez },

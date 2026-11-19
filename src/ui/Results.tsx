@@ -1,4 +1,4 @@
-import type { AnalysisResult, Subcatchment } from '../engine/types'
+import type { AnalysisResult, BasinResult, BmpSetting, Subcatchment } from '../engine/types'
 import { subColor } from './MapView'
 
 export function Kpis({ r }: { r: AnalysisResult }) {
@@ -125,8 +125,34 @@ export function SubDetail({ r, s }: { r: AnalysisResult; s: Subcatchment }) {
   )
 }
 
-export function BasinCards({ r }: { r: AnalysisResult }) {
-  const basins = r.basins.filter((B) => B.kind !== 'trench' && B.inflow.some((x) => x.peak > 0.01))
+/** Per-BMP inputs: infiltration rate for any BMP, plus stone depth and voids for trenches. Re-runs on change. */
+function BmpInputs({ r, B, onBmp }: { r: AnalysisResult; B: BasinResult; onBmp?: (name: string, v: BmpSetting) => void }) {
+  if (!onBmp) return null
+  const cur = r.settings.bmp?.[B.name] ?? {}
+  const num = (v: string) => { const x = parseFloat(v); return Number.isFinite(x) && x >= 0 ? x : undefined }
+  const field = (label: string, key: keyof BmpSetting, val: number | undefined, step: number, ph: string) => (
+    <label class="bmpin">
+      <span>{label}</span>
+      <input type="number" min="0" step={step} value={val ?? ''} placeholder={ph}
+        onChange={(e) => onBmp(B.name, { [key]: num((e.target as HTMLInputElement).value) })} />
+    </label>
+  )
+  return (
+    <div class="bmpins no-print">
+      {field('Infiltration (in/hr)', 'infil', cur.infil, 0.1, '0 = none')}
+      {B.kind === 'trench' && field('Stone depth (ft)', 'depth', cur.depth, 0.5, String(r.settings.trenchDepth ?? 4))}
+      {B.kind === 'trench' && field('Voids', 'voids', cur.voids, 0.05, String(r.settings.trenchVoids ?? 0.4))}
+    </div>
+  )
+}
+
+const infilLine = (r: AnalysisResult, B: BasinResult) =>
+  B.infil && B.infiltrated ? (
+    <div class="mock__line"><span>Infiltrated at {B.infil} in/hr</span><span>{B.infiltrated.map((v, k) => `${r.settings.storms[k].label} ${Math.round(v * 43560).toLocaleString()} cf`).join(' · ')}</span></div>
+  ) : null
+
+export function BasinCards({ r, onBmp }: { r: AnalysisResult; onBmp?: (name: string, v: BmpSetting) => void }) {
+  const basins = r.basins.filter((B) => B.kind !== 'trench')
   const trenches = r.basins.filter((B) => B.kind === 'trench' && B.trench)
   if (!basins.length && !trenches.length) return null
   return (
@@ -136,23 +162,26 @@ export function BasinCards({ r }: { r: AnalysisResult }) {
         const worst = t.results.findIndex((x) => x.overflows)
         return (
           <div class="mock">
-            <div class="mock__eyebrow">{B.name} · Infiltration trench</div>
-            <p class="mock__desc">{Math.round(B.lengthFt ?? 0)} ft along the drip edge × {t.width}' wide × {t.depth}' deep · {(t.voids * 100).toFixed(0)}% voids · {Math.round(t.storageCf).toLocaleString()} cf of storage · overflow to {B.outflowTo}</p>
+            <div class="mock__eyebrow">{B.name} · Infiltration trench (drawn)</div>
+            <p class="mock__desc">{Math.round(B.lengthFt ?? 0)} ft × {t.width.toFixed(1)}' wide × {t.depth}' deep · {(t.voids * 100).toFixed(0)}% voids · {Math.round(t.storageCf).toLocaleString()} cf in the stone · overflow to {B.outflowTo}</p>
+            <BmpInputs r={r} B={B} onBmp={onBmp} />
             <div class="mock__divider" />
-            <div class={`mock__flag ${worst < 0 ? 'ok' : ''}`}>{worst < 0 ? 'Holds every storm' : `Overflows from the ${r.settings.storms[worst].label}`}</div>
+            <div class={`mock__flag ${worst < 0 ? 'ok' : ''}`}>{worst < 0 ? 'Holds every storm' : `Overflows from the ${r.settings.storms[worst].label} on, to ${B.outflowTo}`}</div>
             <div class="mock__lines">
-              <div class="mock__line hd"><span>Storm</span><span>roof peak → overflow · max depth</span></div>
+              <div class="mock__line hd"><span>Storm</span><span>in → overflow · max depth</span></div>
               {t.results.map((x, k) => (
                 <div class={`mock__line ${x.overflows ? 'up' : ''}`}><span>{r.settings.storms[k].label}</span><span>{x.peakIn.toFixed(2)} → {x.peakOut.toFixed(2)} cfs · {x.maxDepth.toFixed(2)} ft</span></div>
               ))}
+              {infilLine(r, B)}
             </div>
           </div>
         )
       })}
       {basins.map((B) => (
         <div class="mock">
-          <div class="mock__eyebrow">{B.name} · Stage-storage from the proposed surface</div>
+          <div class="mock__eyebrow">{B.name} · Stage-storage from the surface</div>
           <p class="mock__desc">Bottom {B.bottom.toFixed(2)} · rim {B.rim.toFixed(2)} · {Math.round(B.maxStorage).toLocaleString()} cf to rim · outlet {B.piped ? 'piped' : 'overland'} to {B.outflowTo}</p>
+          <BmpInputs r={r} B={B} onBmp={onBmp} />
           <div class="mock__divider" />
           {B.outlet ? (
             <>
@@ -164,6 +193,7 @@ export function BasinCards({ r }: { r: AnalysisResult }) {
                 {B.outlet.results.map((x, k) => (
                   <div class={`mock__line ${x.overtops ? 'up' : ''}`}><span>{r.settings.storms[k].label}</span><span>{x.peakIn.toFixed(2)} → {x.peakOut.toFixed(2)} cfs · {x.stage.toFixed(2)}{x.overtops ? ' ▲' : ''}</span></div>
                 ))}
+                {infilLine(r, B)}
               </div>
             </>
           ) : (
